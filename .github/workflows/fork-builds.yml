@@ -1,4 +1,5 @@
 name: Fork binaries
+run-name: Build ${{ inputs.source_ref || 'request.json' }} (${{ inputs.targets || 'all targets' }})
 
 on:
   push:
@@ -21,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-binaries-${{ github.event.inputs.source_ref || 'request-file' }}
+  group: fork-binaries-${{ inputs.source_ref || 'request-file' }}-${{ inputs.targets || 'all' }}
   cancel-in-progress: false
 
 jobs:

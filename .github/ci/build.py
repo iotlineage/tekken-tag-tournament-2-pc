@@ -224,9 +224,10 @@ class Build:
         # older game CMake checks the generic property before generating targets.
         shim = self.work / 'sdl-config'
         shim.mkdir()
-        actual = self.prefix / 'cmake/SDL3'
-        if not actual.is_dir():
-            actual = self.prefix / 'lib/cmake/SDL3'
+        configs = list(self.prefix.rglob('SDL3Config.cmake'))
+        if len(configs) != 1:
+            raise RuntimeError('Expected one installed SDL3 CMake configuration')
+        actual = configs[0].parent
         shutil.copy2(actual / 'SDL3ConfigVersion.cmake', shim)
         (shim / 'SDL3Config.cmake').write_text(
             f'include("{actual.as_posix()}/SDL3Config.cmake")\n'
