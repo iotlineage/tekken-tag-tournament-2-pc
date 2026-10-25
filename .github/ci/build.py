@@ -271,16 +271,28 @@ class Build:
         self.run('Compile Windows XMA decoder', 'cmake', '--build', build,
                  '--parallel', self.jobs, '--target', 'ttt2_ffmpeg', public_output=True)
         self.compile(build, 'tekken_recomp')
+        self.package_windows(build)
+
+    def windows_runtime(self):
+        # os.environ normalizes Windows keys to uppercase. A dict copy no
+        # longer provides its case-insensitive lookup behavior.
+        root = self.env.get('VCTOOLSREDISTDIR') or self.env.get('VCToolsRedistDir')
+        if not root:
+            raise RuntimeError('MSVC redistributable directory is missing from the build environment')
+        dlls = sorted((Path(root) / 'x64').glob('Microsoft.VC*.CRT/*.dll'))
+        if not {'msvcp140.dll', 'vcruntime140.dll'} <= {p.name.lower() for p in dlls}:
+            raise RuntimeError('MSVC x64 runtime DLLs are missing')
+        return dlls
+
+    def package_windows(self, build):
         stage = self.work / 'windows-package'
         stage.mkdir()
         shutil.copy2(build / 'tekken_recomp.exe', stage)
         for name in ('SDL3.dll', 'steam_api64.dll'):
             if (build / name).is_file():
                 shutil.copy2(build / name, stage)
-        crt = Path(self.env['VCToolsRedistDir']) / 'x64'
-        for directory in crt.glob('Microsoft.VC*.CRT'):
-            for dll in directory.glob('*.dll'):
-                shutil.copy2(dll, stage)
+        for dll in self.windows_runtime():
+            shutil.copy2(dll, stage)
         self.archive(stage, 'ttt2-windows-x86_64.zip')
 
     def archive(self, stage, name):
@@ -310,6 +322,8 @@ class Build:
         self.output.mkdir(parents=True, exist_ok=True)
         if any(self.output.iterdir()):
             raise RuntimeError('Artifact directory must start empty')
+        if self.target == 'windows':
+            self.windows_runtime()
         if self.target == 'server':
             self.server()
         else:
