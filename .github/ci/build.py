@@ -183,7 +183,11 @@ class Build:
         dxbuild = self.work / 'dxvk-build'
         self.run('Configure DXVK', 'meson', 'setup', dxbuild, dxvk, '--buildtype=release',
                  '--prefix=' + str(self.prefix), '--libdir=lib', '-Denable_tests=false',
-                 '-Denable_d3d9=false', '-Denable_d3d10=false', '-Ddxvk_native_wsi=sdl3')
+                 '-Denable_d3d9=false', '-Denable_d3d10=false', '-Ddxvk_native_wsi=sdl3',
+                 '-Dc_args=-I' + str(self.prefix / 'include'),
+                 '-Dcpp_args=-I' + str(self.prefix / 'include'),
+                 '-Dc_link_args=-L' + str(self.prefix / 'lib'),
+                 '-Dcpp_link_args=-L' + str(self.prefix / 'lib'))
         self.run('Compile DXVK', 'ninja', '-C', dxbuild, '-j', self.jobs)
         self.run('Install DXVK', 'meson', 'install', '-C', dxbuild)
         build = self.work / 'game-build'
