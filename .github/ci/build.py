@@ -32,7 +32,7 @@ class Build:
         self.cc, self.cxx = ('clang-cl', 'clang-cl') if args.target == 'windows' else ('clang', 'clang++')
         self.env.update(CC=self.cc, CXX=self.cxx)
 
-    def run(self, label, *args, cwd=None, env=None):
+    def run(self, label, *args, cwd=None, env=None, public_output=False):
         print(label, flush=True)
         self.counter += 1
         # Compiler errors and recompiler output can quote original game bytes.
@@ -44,6 +44,8 @@ class Build:
             result = subprocess.run(command, cwd=cwd or self.source,
                                     env=env or self.env, stdout=log, stderr=subprocess.STDOUT)
         if result.returncode:
+            if public_output:
+                print('\n'.join((self.work / f'private-log-{self.counter}.txt').read_text(errors='replace').splitlines()[-60:]), flush=True)
             raise RuntimeError(f'{label} failed (exit {result.returncode}); private log withheld')
 
     def clone(self, url, revision, destination):
@@ -54,15 +56,31 @@ class Build:
     def cmake(self, source, build, *options):
         self.run('Configure ' + source.name, 'cmake', '-S', source, '-B', build, '-G', 'Ninja',
                  '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
-                 '-DCMAKE_C_COMPILER=' + self.cc, '-DCMAKE_CXX_COMPILER=' + self.cxx, *options)
+                 '-DCMAKE_C_COMPILER=' + self.cc, '-DCMAKE_CXX_COMPILER=' + self.cxx, *options,
+                 public_output=source != self.source / 'port')
 
     def compile(self, build, *targets):
         self.run('Compile ' + build.name, 'cmake', '--build', build, '--parallel', self.jobs,
-                 *(['--target', *targets] if targets else []))
+                 *(['--target', *targets] if targets else []), public_output=build.name != 'game-build')
 
     def script(self, relative, *args):
-        self.run(Path(relative).name, sys.executable if relative.endswith('.py') else 'bash',
-                 self.source / relative, *args)
+        public_scripts = {
+            'port/tools/build_android_sdl_shell.sh': 'android-sdl-shell',
+            'port/tools/build_android_ffmpeg_xma.sh': 'android-ffmpeg-xma',
+            'port/tools/build_android_vkd3d_shader.sh': 'android-vkd3d-1.17',
+            'port/tools/build_android_openssl.sh': 'android-openssl',
+        }
+        try:
+            self.run(Path(relative).name, sys.executable if relative.endswith('.py') else 'bash',
+                     self.source / relative, *args, public_output=relative in public_scripts)
+        except RuntimeError:
+            # Only open-source dependency logs are eligible for public diagnostics.
+            # Generated game code, signing logs and the combined APK build stay private.
+            if relative in public_scripts:
+                directory = self.work / 'cache/ttt2-platform' / public_scripts[relative]
+                for log in sorted(directory.glob('*.log')):
+                    print(log.name + ':\n' + '\n'.join(log.read_text(errors='replace').splitlines()[-30:]), flush=True)
+            raise
 
     def generate(self):
         manifest = json.loads((self.inputs / 'manifest.json').read_text())
@@ -187,8 +205,8 @@ class Build:
                  '-Dc_args=-I' + str(self.prefix / 'include'),
                  '-Dcpp_args=-I' + str(self.prefix / 'include'),
                  '-Dc_link_args=-L' + str(self.prefix / 'lib'),
-                 '-Dcpp_link_args=-L' + str(self.prefix / 'lib'))
-        self.run('Compile DXVK', 'ninja', '-C', dxbuild, '-j', self.jobs)
+                 '-Dcpp_link_args=-L' + str(self.prefix / 'lib'), public_output=True)
+        self.run('Compile DXVK', 'ninja', '-C', dxbuild, '-j', self.jobs, public_output=True)
         self.run('Install DXVK', 'meson', 'install', '-C', dxbuild)
         build = self.work / 'game-build'
         sdk = self.steam()

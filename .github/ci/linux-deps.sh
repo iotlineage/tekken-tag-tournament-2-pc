@@ -2,7 +2,7 @@
 set -euo pipefail
 sudo apt-get update -qq
 sudo apt-get install -y --no-install-recommends \
-  clang lld cmake ninja-build meson pkg-config git curl zip unzip \
+  clang lld cmake ninja-build meson pkg-config git curl zip unzip ripgrep \
   autoconf automake libtool bison flex libjson-perl wine64-tools \
   libvulkan-dev spirv-headers glslang-tools libssl-dev patchelf \
   libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
