@@ -34,8 +34,10 @@
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
 
+#ifdef _WIN32
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace server_list {
 namespace {
@@ -651,5 +653,50 @@ std::vector<Found> Lan()
 }
 
 uint32_t Version() { return g_version.load(); }
+
+namespace {
+std::filesystem::path AccountFolder() {
+    if (const char* dir = std::getenv("TTT2_COMMUNITY_PRIVATE_DIR"); dir && *dir)
+        return std::filesystem::path(dir) / "accounts";
+    return std::filesystem::path(FilePath()).parent_path() / "community";
+}
+}
+
+// Separate from the removable server list: removing a pin must not lose an account.
+std::string LoadCredential(const std::string& fingerprint)
+{
+    if (fingerprint.size() != 64 || fingerprint.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return {};
+    std::lock_guard l(g_mutex);
+    const auto file = AccountFolder() / (fingerprint + ".account");
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec) && !ec) return {};
+    std::ifstream in(file); std::string stored; std::getline(in, stored);
+    const auto credential = Unprotect(stored);
+    // Fail authentication instead of silently overwriting an unreadable account.
+    return credential.empty() ? "unreadable-local-account" : credential;
+}
+
+bool SaveCredential(const std::string& fingerprint, const std::string& credential)
+{
+    if (fingerprint.size() != 64 || fingerprint.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos || credential.size() > 128) return false;
+    std::lock_guard l(g_mutex);
+    const std::string stored = Protect(credential);
+    if (stored.empty()) return false;
+    const auto folder = AccountFolder();
+    std::error_code ec; std::filesystem::create_directories(folder, ec);
+    if (ec) return false;
+    const auto file = folder / (fingerprint + ".account");
+    const auto temp = folder / (fingerprint + ".account.tmp");
+    { std::ofstream out(temp, std::ios::trunc); out << stored << "\n"; out.close(); if (!out) return false; }
+#ifndef _WIN32
+    std::filesystem::permissions(temp, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, ec);
+    if (ec) return false;
+#else
+    // Windows rename cannot replace a file; MoveFileEx preserves the old file on failure.
+    return MoveFileExW(temp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#endif
+    std::filesystem::rename(temp, file, ec);
+    return !ec;
+}
 
 } // namespace server_list

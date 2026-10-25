@@ -64,20 +64,24 @@ const (
 
 // Player is one connected game.
 type Player struct {
-	Peer     uint64
-	Name     string
-	Proto    string
-	Verified bool
-	prefix   string // address (IPv6: /64) for the per-prefix limits
-	ip       string
-	conn     *tls.Conn
-	raw      net.Conn
-	failing  atomic.Bool // an ERROR is on its way: input is only drained now
-	out      chan []byte // whole frames, written by the player's writer goroutine
-	queued   atomic.Int64
-	closed   chan struct{}
-	once     sync.Once
-	since    time.Time
+	discovery      map[*Player]discoveryLease // protected by Hub.mu
+	Crossplay      bool
+	SteamID        uint64 // verified Steam binding, never a client assertion
+	rooms, signals bucket
+	Peer           uint64
+	Name           string
+	Proto          string
+	Verified       bool
+	prefix         string // address (IPv6: /64) for the per-prefix limits
+	ip             string
+	conn           *tls.Conn
+	raw            net.Conn
+	failing        atomic.Bool // an ERROR is on its way: input is only drained now
+	out            chan []byte // whole frames, written by the player's writer goroutine
+	queued         atomic.Int64
+	closed         chan struct{}
+	once           sync.Once
+	since          time.Time
 
 	// rates, used by the player's reader goroutine only
 	frames, puts, lists, invites, gins, statWrites, statReadRate, arbs, logs, peerChecks, names bucket
@@ -86,6 +90,7 @@ type Player struct {
 }
 
 type session struct {
+	joinCode    string
 	id          uint64
 	host        *Player
 	record      []byte
@@ -142,15 +147,16 @@ type Hub struct {
 	files     FileStore // nil: the player files (licenses) are not kept
 
 	// mu, then matches.mu, is the only order the two are ever held in
-	mu         sync.Mutex
-	players    map[uint64]*Player
-	sessions   map[uint64]*session
-	lists      listCache
-	perPrefix  map[string]int
-	pendPrefix map[string]int
-	pending    int
-	fails      map[string]*failState
-	inviteRate map[uint64]*bucket // invites received, per target
+	mu          sync.Mutex
+	players     map[uint64]*Player
+	sessions    map[uint64]*session
+	roomMembers map[uint64]map[*Player]bool
+	lists       listCache
+	perPrefix   map[string]int
+	pendPrefix  map[string]int
+	pending     int
+	fails       map[string]*failState
+	inviteRate  map[uint64]*bucket // invites received, per target
 
 	udp  *net.UDPConn
 	info infoState
@@ -166,19 +172,20 @@ type listCache struct {
 // New makes a hub. A nil verifier means the configuration chose to trust unverified Steam IDs.
 func New(cfg config.Config, id tlsid.Identity, verifier Verifier, bans *Bans, logger *log.Logger) *Hub {
 	h := &Hub{
-		id:         id,
-		tlsCfg:     id.ServerConfig(),
-		verifier:   verifier,
-		verifies:   make(chan struct{}, verifyConcurrency),
-		log:        logger,
-		started:    time.Now(),
-		bans:       bans,
-		players:    map[uint64]*Player{},
-		sessions:   map[uint64]*session{},
-		perPrefix:  map[string]int{},
-		pendPrefix: map[string]int{},
-		fails:      map[string]*failState{},
-		inviteRate: map[uint64]*bucket{},
+		id:          id,
+		tlsCfg:      id.ServerConfig(),
+		verifier:    verifier,
+		verifies:    make(chan struct{}, verifyConcurrency),
+		log:         logger,
+		started:     time.Now(),
+		bans:        bans,
+		players:     map[uint64]*Player{},
+		sessions:    map[uint64]*session{},
+		roomMembers: map[uint64]map[*Player]bool{},
+		perPrefix:   map[string]int{},
+		pendPrefix:  map[string]int{},
+		fails:       map[string]*failState{},
+		inviteRate:  map[uint64]*bucket{},
 	}
 	if h.bans == nil {
 		h.bans = NewBans("")
@@ -472,8 +479,11 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 	}
 	r := wire.Reader{B: payload}
 	version, proto, _ := r.U16(), r.Str(), r.Str()
-	if r.Err() != nil || version != wire.ProtocolVersion {
+	if r.Err() != nil || (version != wire.ProtocolVersion && version != 3) {
 		return nil, refuse(c, wire.ErrProtocol, fmt.Sprintf("This server speaks protocol %d.", wire.ProtocolVersion), nil, false)
+	}
+	if version == 3 && !cfg.Crossplay {
+		return nil, refuse(c, wire.ErrProtocol, "Cross-platform sessions are disabled here.", nil, false)
 	}
 	accepted := false
 	for _, a := range cfg.AcceptedProtocols {
@@ -492,14 +502,41 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 	}
 	r = wire.Reader{B: payload}
 	peer, name, ticket, password := r.U64(), r.Str(), r.Blob(), r.Str()
-	if r.Err() != nil || peer == 0 || len(ticket) > 5120 {
+	if r.Err() != nil || (peer == 0 && version != 3) || len(ticket) > 5120 {
 		return nil, refuse(c, wire.ErrMalformed, "Malformed login.", nil, true)
 	}
 	if cfg.Password != "" && !constantTimeEqual(password, cfg.Password) {
 		return nil, refuse(c, wire.ErrPassword, "Wrong server password.", nil, true)
 	}
 	verified := false
-	if h.verifier != nil {
+	var credential string
+	var steamID uint64
+	if version == 3 {
+		claimedSteam, steamTicket := r.U64(), r.Blob()
+		if r.Err() != nil || len(r.B) != 0 || peer != 0 {
+			return nil, refuse(c, wire.ErrMalformed, "Malformed crossplay login.", nil, true)
+		}
+		var authErr error
+		peer, credential, authErr = h.communityIdentity(string(ticket))
+		if authErr != nil {
+			return nil, refuse(c, wire.ErrAuth, "Invalid community credential.", nil, true)
+		}
+		if h.verifier != nil && (claimedSteam != 0 || len(steamTicket) != 0) {
+			if !plausibleTicket(steamTicket) || !h.beginVerify() {
+				return nil, refuse(c, wire.ErrAuth, "Steam identity could not be verified.", nil, false)
+			}
+			raw.SetDeadline(time.Time{})
+			checked, err := h.verifier.Verify(string(steamTicket), h.id.SteamIdentity())
+			<-h.verifies
+			raw.SetDeadline(time.Now().Add(lingerTime + time.Second))
+			if err != nil || checked != claimedSteam || checked == 0 {
+				return nil, refuse(c, wire.ErrAuth, "Steam identity could not be verified.", nil, true)
+			}
+			steamID, verified = checked, true
+		}
+	} else if h.verifier == nil && !cfg.TrustUnverified && cfg.Crossplay {
+		return nil, refuse(c, wire.ErrAuth, "Legacy Steam login is disabled here.", nil, false)
+	} else if h.verifier != nil {
 		if len(ticket) == 0 {
 			return nil, refuse(c, wire.ErrAuth, "This server checks Steam accounts: start Steam and try again.", nil, false)
 		}
@@ -531,12 +568,12 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 		return nil, refuseWith(c, bannedPayload(refusalText(e, now), e.Until, now), why, true)
 	}
 	p := &Player{
-		Peer: peer, Name: CleanName(name), Proto: proto, Verified: verified, ip: ip, prefix: prefix, conn: c, raw: raw,
+		Crossplay: version == 3, SteamID: steamID, Peer: peer, Name: CleanName(name), Proto: proto, Verified: verified, ip: ip, prefix: prefix, conn: c, raw: raw,
 		out: make(chan []byte, sendQueue), closed: make(chan struct{}), since: time.Now(),
 	}
 	h.mu.Lock()
 	old := h.players[peer]
-	if old != nil && !verified {
+	if old != nil && !verified && version != 3 {
 		// Without Steam checks anyone can claim any ID: an online player is never replaced (L3).
 		h.mu.Unlock()
 		return nil, refuse(c, wire.ErrDuplicate, "This Steam ID is already connected to the server.", nil, false)
@@ -578,6 +615,15 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 	w.Str(cfg.Name)
 	w.Str(cfg.Region)
 	w.Str(cfg.MOTD)
+	if p.Crossplay {
+		w.Str(credential)
+		w.U64(p.SteamID)
+		w.Str(cfg.STUNServer)
+		w.Str(cfg.TURNServer)
+		user, pass := turnCredential(cfg.TURNSecret, peer, time.Now())
+		w.Str(user)
+		w.Str(pass)
+	}
 	p.send(wire.Welcome, w.B)
 	return p, nil
 }
@@ -656,6 +702,8 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 	r := wire.Reader{B: payload}
 	now := time.Now()
 	switch typ {
+	case wire.RoomJoin, wire.RoomLeave, wire.Signal, wire.RelayRequest:
+		return h.crossplayFrame(p, typ, payload)
 	case wire.Ping:
 		nonce := r.U64()
 		if r.Err() != nil {
@@ -680,6 +728,7 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 		}
 		h.mu.Lock()
 		if s := h.sessions[id]; s != nil && s.host == p {
+			h.removeRoomLocked(id)
 			delete(h.sessions, id)
 			h.log.Printf("session %016X of %q removed", id, p.Name)
 		}
@@ -721,9 +770,10 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 		var w wire.Writer
 		w.U32(request)
 		h.mu.Lock()
-		if s := h.sessions[id]; s != nil && s.host.Proto == p.Proto && s.host != p {
+		if s := h.sessions[id]; s != nil && s.host.Proto == p.Proto && s.host.Crossplay == p.Crossplay && s.host != p {
 			w.U8(1)
 			w.Blob(s.record)
+			h.grantDiscoveryLocked(p, s)
 		} else {
 			w.U8(0)
 			w.Blob(nil)
@@ -791,7 +841,7 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 		if p.peerChecks.take(10, 40, now) {
 			h.mu.Lock()
 			q := h.players[peer]
-			here := q != nil && q != p && q.Proto == p.Proto
+			here := q != nil && q != p && q.Proto == p.Proto && q.Crossplay == p.Crossplay && (!p.Crossplay || h.shareRoomLocked(p, q))
 			h.mu.Unlock()
 			answer = 0
 			if here {
@@ -860,7 +910,7 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 		}
 		h.mu.Lock()
 		target, s := h.players[to], h.sessions[id]
-		ok := target != nil && target != p && s != nil && s.host == p && target.Proto == p.Proto
+		ok := target != nil && target != p && s != nil && s.host == p && target.Proto == p.Proto && target.Crossplay == p.Crossplay
 		if ok {
 			b := h.inviteRate[to]
 			if b == nil {
@@ -874,6 +924,7 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 			var w wire.Writer
 			w.U64(p.Peer)
 			w.Blob(s.record)
+			h.grantDiscoveryLocked(p, s)
 			target.send(wire.Invite, w.B)
 		}
 	default:
@@ -887,12 +938,29 @@ func (h *Hub) putSession(p *Player, rec []byte) error {
 	if err != nil {
 		return err
 	}
+	if info.Crossplay != p.Crossplay {
+		return errors.New("session type does not match connection")
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.players[p.Peer] != p {
+		return errors.New("replaced connection")
+	}
 	if s := h.sessions[info.ID]; s != nil && s.host != p {
 		return fmt.Errorf("session %016X belongs to another player", info.ID)
 	}
 	if h.sessions[info.ID] == nil {
+		if p.Crossplay {
+			joined := 0
+			for _, group := range h.roomMembers {
+				if group[p] {
+					joined++
+				}
+			}
+			if joined >= maxSessionsEach {
+				return errors.New("too many room memberships")
+			}
+		}
 		owned := 0
 		for _, s := range h.sessions {
 			if s.host == p {
@@ -905,11 +973,27 @@ func (h *Hub) putSession(p *Player, rec []byte) error {
 		h.log.Printf("session %016X hosted by %q", info.ID, p.Name)
 	}
 	created := time.Now()
+	joinCode := ""
+	if p.Crossplay {
+		var key [16]byte
+		if _, err := rand.Read(key[:]); err != nil {
+			return err
+		}
+		joinCode = fmt.Sprintf("%x", key[:])
+	}
 	if old := h.sessions[info.ID]; old != nil {
+		joinCode = old.joinCode
 		created = old.created // republishing (a slot filled) does not move a room to the top of the lists
 	}
-	h.sessions[info.ID] = &session{id: info.ID, host: p, record: append([]byte(nil), rec...), filled: info.Filled, max: info.Max,
+	h.sessions[info.ID] = &session{joinCode: joinCode, id: info.ID, host: p, record: append([]byte(nil), rec...), filled: info.Filled, max: info.Max,
 		open: info.OpenPublic, contexts: info.Contexts, ranked: info.Flags&record.Arbitrated != 0, created: created, updated: time.Now()}
+	if p.Crossplay {
+		if h.roomMembers[info.ID] == nil {
+			h.roomMembers[info.ID] = map[*Player]bool{}
+		}
+		h.roomMembers[info.ID][p] = true
+		h.notifyRoomLocked(info.ID)
+	}
 	return nil
 }
 
@@ -931,7 +1015,7 @@ func (h *Hub) listSessions(p *Player, max int, f listFilter) [][]byte {
 		if len(picks) >= max {
 			break
 		}
-		if s.host == p || hosts[s.host] || bytes+len(s.record) > maxListBytes || !f.match(s) {
+		if s.host == p || s.host.Crossplay != p.Crossplay || hosts[s.host] || bytes+len(s.record) > maxListBytes || !f.match(s) {
 			continue // its own, that host's already picked, too much, or not asked for
 		}
 		hosts[s.host] = true
@@ -943,6 +1027,7 @@ func (h *Hub) listSessions(p *Player, max int, f listFilter) [][]byte {
 	for _, s := range picks {
 		// its current record, if it is still there and still matches (updated since the snapshot: the newer one)
 		if cur := h.sessions[s.id]; cur != nil && cur.host == s.host && f.match(cur) {
+			h.grantDiscoveryLocked(p, cur)
 			out = append(out, cur.record)
 		}
 	}
@@ -979,8 +1064,16 @@ func (h *Hub) leave(p *Player) {
 // removeLocked drops a player and their sessions (h.mu held; no network I/O here).
 func (h *Hub) removeLocked(p *Player) {
 	delete(h.players, p.Peer)
+	h.pruneDiscoveryLocked(p)
+	for id, members := range h.roomMembers {
+		if members[p] {
+			delete(members, p)
+			h.notifyRoomLocked(id)
+		}
+	}
 	for id, s := range h.sessions {
 		if s.host == p {
+			h.removeRoomLocked(id)
 			delete(h.sessions, id)
 		}
 	}

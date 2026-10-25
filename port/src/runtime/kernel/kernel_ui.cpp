@@ -161,3 +161,65 @@ PPC_FUNC(__imp__XamShowMessageBoxUI) {
         ctx.r3.u32 = kNoMemory;
     }
 }
+
+// The title's keyboard task sub_8269CBB8 calls sub_82BEE8A8 -> XamShowKeyboardUI
+// with result in r8, capacity (including NUL) in r9, XOVERLAPPED in r10.
+// The title polls XOVERLAPPED and handles ERROR_CANCELLED.
+// Completing the real input request lets the original session/chat code consume
+// the text and send its normal game packets through the selected transport.
+PPC_FUNC(__imp__XamShowKeyboardUI) {
+    KTrace("XamShowKeyboardUI");
+    const uint32_t result = ctx.r8.u32, capacity = ctx.r9.u32, overlapped = ctx.r10.u32;
+    if (!overlapped) { ctx.r3.u32 = kNotSupported; return; }
+    if (ctx.r3.u32 >= 4 || capacity < 1 || capacity > 2048 ||
+        !XamGuestRange(result, uint64_t(capacity) * 2, 2) || !host_vm::CanWrite(base + result, size_t(capacity) * 2) ||
+        !WritableGuestRange(base, overlapped, 28) ||
+        (uint64_t(result) < uint64_t(overlapped) + 28 && uint64_t(overlapped) < uint64_t(result) + capacity * 2)) {
+        ctx.r3.u32 = kInvalidParameter; return;
+    }
+    if (const auto error = XamValidateOverlapped(base, overlapped)) { ctx.r3.u32 = error; return; }
+    std::u16string initial, title, description;
+    if (!CopyGuestText(base, ctx.r5.u32, 2048, true, initial) ||
+        !CopyGuestText(base, ctx.r6.u32, 256, true, title) ||
+        !CopyGuestText(base, ctx.r7.u32, 2048, true, description)) {
+        ctx.r3.u32 = kInvalidParameter; return;
+    }
+    SysUiTextBox box;
+    box.prompt = Utf8(title.empty() ? description : title);
+    box.text = Utf8(initial);
+    box.maxLength = capacity - 1;
+    box.allowed = " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+    box.hint = "ENTER: send   ESC: cancel";
+    box.done = [base, result, capacity, overlapped](bool ok, const std::string& text) {
+        std::u16string units;
+        // The text box types ASCII, but its initial value can contain UTF-8.
+        for (size_t i = 0; i < text.size();) {
+            uint32_t cp = uint8_t(text[i++]); unsigned extra = 0;
+            if (cp >= 0xF0) { cp &= 7; extra = 3; }
+            else if (cp >= 0xE0) { cp &= 15; extra = 2; }
+            else if (cp >= 0xC0) { cp &= 31; extra = 1; }
+            for (unsigned n = 0; n < extra && i < text.size(); ++n) cp = (cp << 6) | (uint8_t(text[i++]) & 63);
+            if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+            const size_t needed = cp > 0xFFFF ? 2 : 1;
+            if (units.size() + needed >= capacity) break;
+            if (needed == 2) { cp -= 0x10000; units.push_back(char16_t(0xD800 | (cp >> 10))); units.push_back(char16_t(0xDC00 | (cp & 1023))); }
+            else units.push_back(char16_t(cp));
+        }
+        if (ok) {
+            for (size_t i = 0; i < units.size(); ++i) GWrite16(base, result + uint32_t(i * 2), units[i]);
+            GWrite16(base, result + uint32_t(units.size() * 2), 0);
+        }
+        XamCompleteOverlapped(base, overlapped, ok ? 0 : 1223, 0, ok ? 0 : 1223);
+        XamNotifyEnqueueEvent(9, 0);
+    };
+    const uint32_t saved[3] = {GRead32(base, overlapped), GRead32(base, overlapped + 4), GRead32(base, overlapped + 24)};
+    GWrite32(base, overlapped + 4, 0); GWrite32(base, overlapped + 24, 0);
+    std::atomic_thread_fence(std::memory_order_release);
+    GWrite32(base, overlapped, kPending);
+    if (!SysUiShowTextBox(std::move(box))) {
+        GWrite32(base, overlapped, saved[0]); GWrite32(base, overlapped + 4, saved[1]); GWrite32(base, overlapped + 24, saved[2]);
+        ctx.r3.u32 = kAccessDenied; return;
+    }
+    XamNotifyEnqueueEvent(9, 1);
+    ctx.r3.u32 = kPending;
+}

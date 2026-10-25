@@ -1,0 +1,22 @@
+option(TTT2_CROSSPLAY "Build self-hosted cross-platform networking" OFF)
+function(ttt2_enable_crossplay target)
+    if(NOT TARGET ttt2_crossplay_transport)
+        add_library(ttt2_crossplay_transport STATIC
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../src/runtime/kernel/crossplay_net.cpp")
+        set_target_properties(ttt2_crossplay_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        if(TTT2_CROSSPLAY)
+            if(ANDROID AND TTT2_OPENSSL_ROOT)
+                set(OPENSSL_INCLUDE_DIR "${TTT2_OPENSSL_ROOT}/include")
+                set(OPENSSL_CRYPTO_LIBRARY "${TTT2_OPENSSL_ROOT}/lib/libcrypto.a")
+                set(OPENSSL_SSL_LIBRARY "${TTT2_OPENSSL_ROOT}/lib/libssl.a")
+            endif()
+            # Modern protobuf's config carries its Abseil dependencies; the
+            # FindProtobuf module used by GNS's export can otherwise omit them.
+            find_package(Protobuf CONFIG QUIET)
+            find_package(GameNetworkingSockets CONFIG REQUIRED)
+            target_link_libraries(ttt2_crossplay_transport PRIVATE GameNetworkingSockets::GameNetworkingSockets_s)
+            target_compile_definitions(ttt2_crossplay_transport PRIVATE TTT2_HAVE_GNS=1)
+        endif()
+    endif()
+    target_link_libraries(${target} PRIVATE ttt2_crossplay_transport)
+endfunction()

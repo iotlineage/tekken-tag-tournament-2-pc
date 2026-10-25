@@ -14,6 +14,9 @@
 
 namespace server_list {
 
+std::string LoadCredential(const std::string& fingerprint);
+bool SaveCredential(const std::string& fingerprint, const std::string& credential);
+
 constexpr size_t kMaxSaved = 32;
 constexpr uint16_t kDefaultPort = 28200;
 

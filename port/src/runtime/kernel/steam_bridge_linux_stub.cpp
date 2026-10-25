@@ -16,4 +16,6 @@ std::vector<FriendInfo> Friends(int) { return {}; }
 bool InviteToSession(uint64_t, uint64_t, int) { return false; }
 bool WebApiTicket(const std::string&, std::string& hex, uint32_t& handle, int) { hex.clear(); handle = 0; return false; }
 void CancelTicket(uint32_t) {}
+void PlayedWith(uint64_t) {}
+void RequestJoinLobby(uint64_t) {}
 } // namespace steamnet

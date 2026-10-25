@@ -1,4 +1,4 @@
-// Session discovery (matchmaking.h): the folder backend.
+// Session discovery and invitations across Steam, community and local backends.
 #include "host_settings.h"
 #include "matchmaking.h"
 #include "community_net.h"
@@ -11,7 +11,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <deque>
+#include "server_list.h"
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 
@@ -25,6 +28,8 @@ std::mutex g_mutex;
 std::map<uint64_t, SessionRecord> g_owned;
 std::map<uint64_t, SessionRecord> g_seen;       // listed or invited sessions, for Find
 bool g_heartbeat = false;
+std::deque<SessionRecord> g_invites;
+std::set<uint64_t> g_socialRooms;
 
 bool Steam() { return std::strcmp(net::BackendName(), "steam") == 0; }
 std::shared_ptr<community::Client> Server() { return net::Community(); }
@@ -46,7 +51,7 @@ void Put64(std::vector<uint8_t>& v, uint64_t x) { Put32(v, uint32_t(x)); Put32(v
 std::vector<uint8_t> Serialize(const SessionRecord& r)
 {
     std::vector<uint8_t> v;
-    Put32(v, kMagic);
+    Put32(v, r.crossplay ? 0x33534553u : kMagic);
     Put64(v, r.id);
     Put64(v, r.hostPeer);
     Put64(v, r.hostXuid);
@@ -63,6 +68,12 @@ std::vector<uint8_t> Serialize(const SessionRecord& r)
         v.insert(v.end(), p.value.begin(), p.value.end());
     }
     Put32(v, r.netcode);                       // last: records without it read as 0
+    if (r.crossplay) {
+        for (const auto& text : {r.serverAddress, r.roomCode}) {
+            const uint16_t n = uint16_t(text.size()); v.push_back(uint8_t(n)); v.push_back(uint8_t(n >> 8));
+            v.insert(v.end(), text.begin(), text.end());
+        }
+    }
     return v;
 }
 
@@ -77,7 +88,7 @@ bool Deserialize(const std::vector<uint8_t>& v, SessionRecord& r)
     };
     auto get64 = [&](uint64_t& x) { uint32_t lo, hi; if (!get32(lo) || !get32(hi)) return false; x = uint64_t(hi) << 32 | lo; return true; };
     uint32_t magic = 0, n = 0;
-    if (!get32(magic) || magic != kMagic || !get64(r.id) || !get64(r.hostPeer) || !get64(r.hostXuid) || !get32(r.flags) ||
+    if (!get32(magic) || (magic != kMagic && magic != 0x33534553u) || !get64(r.id) || !get64(r.hostPeer) || !get64(r.hostXuid) || !get32(r.flags) ||
         !get32(r.maxPublic) ||
         !get32(r.maxPrivate) || !get32(r.filledPublic) || !get32(r.filledPrivate) || at + sizeof(r.info) > v.size())
         return false;
@@ -97,7 +108,20 @@ bool Deserialize(const std::vector<uint8_t>& v, SessionRecord& r)
     }
     r.netcode = 0;
     if (at + 4 <= v.size()) get32(r.netcode);
-    return true;
+    r.crossplay = magic == 0x33534553u;
+    r.serverAddress.clear();
+    r.roomCode.clear();
+    if (r.crossplay) {
+        for (auto* text : {&r.serverAddress, &r.roomCode}) {
+            if (at + 2 > v.size()) return false;
+            const size_t n = v[at] | size_t(v[at+1]) << 8; at += 2;
+            if (n > (text == &r.serverAddress ? 512u : 32u) || at + n > v.size()) return false;
+            text->assign(reinterpret_cast<const char*>(v.data()+at), n); at += n;
+        }
+        std::string host; uint16_t port;
+        if (!community::ParseAddress(r.serverAddress, host, port)) return false;
+    }
+    return at == v.size();
 }
 
 void Write(const SessionRecord& r)
@@ -119,7 +143,7 @@ void Heartbeat()
     {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         std::lock_guard l(g_mutex);
-        for (const auto& [id, r] : g_owned) Write(r);
+        if (!Server() && !Steam()) for (const auto& [id, r] : g_owned) Write(r);
     }
 }
 
@@ -145,7 +169,20 @@ void Publish(const SessionRecord& record)
 {
     std::lock_guard l(g_mutex);
     g_owned[record.id] = record;
-    if (const std::shared_ptr<community::Client> server = Server()) server->PublishSession(Serialize(record));
+    if (const std::shared_ptr<community::Client> server = Server()) {
+        SessionRecord advertised = record;
+        advertised.crossplay = server->Crossplay();
+        advertised.serverAddress = net::ServerAddress();
+        server->PublishSession(Serialize(advertised));
+        if (server->Crossplay() && steamnet::Running()) {
+            if (server->RoomCode(record.id).empty()) server->JoinRoom(record.id);
+            advertised.roomCode = server->RoomCode(record.id);
+            if (!advertised.roomCode.empty()) {
+                steamnet::PublishLobby(record.id, Serialize(advertised));
+                g_socialRooms.insert(record.id);
+            }
+        }
+    }
     else if (Steam()) steamnet::PublishLobby(record.id, Serialize(record));
     else
     {
@@ -159,9 +196,10 @@ void Publish(const SessionRecord& record)
 void Remove(uint64_t id)
 {
     std::lock_guard l(g_mutex);
+    steamnet::RemoveLobby(id);
+    g_socialRooms.erase(id);
     if (!g_owned.erase(id)) return;
     if (const std::shared_ptr<community::Client> server = Server()) { server->RemoveSession(id); std::fprintf(stderr, "[mm] removed %016llX\n", (unsigned long long)id); return; }
-    if (Steam()) steamnet::RemoveLobby(id);
     std::error_code ec;
     std::filesystem::remove(FileOf(id), ec);
     std::fprintf(stderr, "[mm] removed %016llX\n", (unsigned long long)id);
@@ -175,7 +213,7 @@ std::vector<SessionRecord> List(uint32_t max, const std::vector<std::pair<uint32
         for (const std::vector<uint8_t>& bytes : server->ListSessions((std::max)(max, 1u), 5000, contexts, openOnly))
         {
             SessionRecord r;
-            if (out.size() >= max || !Deserialize(bytes, r) || r.hostPeer == net::LocalPeer()) continue;
+            if (out.size() >= max || !Deserialize(bytes, r) || r.crossplay != server->Crossplay() || r.hostPeer == net::LocalPeer()) continue;
             {
                 std::lock_guard l(g_mutex);
                 g_seen[r.id] = r;
@@ -219,34 +257,74 @@ std::vector<SessionRecord> List(uint32_t max, const std::vector<std::pair<uint32
 
 bool Find(uint64_t id, SessionRecord& out)
 {
+    SessionRecord cached;
+    bool haveCached = false;
     {
         std::lock_guard l(g_mutex);
         const auto it = g_seen.find(id);
-        if (it != g_seen.end()) { out = it->second; return true; }
+        if (it != g_seen.end()) { cached = it->second; haveCached = true; }
     }
-    if (const std::shared_ptr<community::Client> server = Server())
-    {
+    if (const auto server = Server()) {
         std::vector<uint8_t> bytes;
-        if (!server->GetSession(id, bytes, 2000) || !Deserialize(bytes, out) || out.id != id) return false;
+        if (!server->GetSession(id, bytes, 2000) || !Deserialize(bytes, out) || out.id != id ||
+            out.crossplay != server->Crossplay()) return false;
+        // Invite metadata supplies only the capability; the current server owns the room record.
+        if (haveCached && cached.hostPeer == out.hostPeer && cached.crossplay == out.crossplay &&
+            server_list::SameAddress(cached.serverAddress, net::ServerAddress())) out.roomCode = cached.roomCode;
+        out.serverAddress = net::ServerAddress();
         std::lock_guard l(g_mutex);
         g_seen[id] = out;
         return true;
     }
-    if (Steam()) return false;
-    const std::filesystem::path file = FileOf(id);
+    if (Steam()) { if (!haveCached || cached.crossplay) return false; out = cached; return true; }
+    const auto file = FileOf(id);
     return Fresh(file) && Load(file, out);
 }
 
+void HideSocialRooms() {
+    std::lock_guard l(g_mutex);
+    for (auto id : g_socialRooms) steamnet::RemoveLobby(id);
+    g_socialRooms.clear();
+}
+void ClearSeen() {
+    HideSocialRooms();
+    std::lock_guard l(g_mutex); g_seen.clear(); g_invites.clear();
+}
+void AdvertiseInvite(const SessionRecord& record) {
+    std::lock_guard l(g_mutex);
+    if (record.crossplay && !record.roomCode.empty() && steamnet::Running()) {
+        steamnet::PublishLobby(record.id, Serialize(record));
+        g_socialRooms.insert(record.id);
+    }
+}
+void QueueInvite(const SessionRecord& record) {
+    std::lock_guard l(g_mutex); if (g_invites.size() < 8) g_invites.push_back(record);
+}
+bool TakeSteamInvite(SessionRecord& out) {
+    std::vector<uint8_t> bytes;
+    return steamnet::TakeJoinRequest(bytes) && Deserialize(bytes, out);
+}
 bool TakeInvite(SessionRecord& out)
 {
-    std::vector<uint8_t> bytes;
-    if (const std::shared_ptr<community::Client> server = Server())
-    {
+    if (const auto server = Server()) {
+        std::vector<uint8_t> bytes;
         uint64_t from = 0;
-        if (!server->TakeInvite(bytes, from) || !Deserialize(bytes, out)) return false;
+        SessionRecord invited;
+        if (server->TakeInvite(bytes, from) && Deserialize(bytes, invited) &&
+            invited.crossplay == server->Crossplay()) {
+            if (invited.crossplay) invited.serverAddress = net::ServerAddress();
+            QueueInvite(invited);
+        }
     }
-    else if (!steamnet::TakeJoinRequest(bytes) || !Deserialize(bytes, out)) return false;
+    if (const auto disabled = std::getenv("TTT2_SRV_UI"); disabled && *disabled == '0') {
+        SessionRecord invited;
+        if (TakeSteamInvite(invited) && !invited.crossplay && !Server()) QueueInvite(invited);
+    }
     std::lock_guard l(g_mutex);
+    if (g_invites.empty()) return false;
+    out = std::move(g_invites.front()); g_invites.pop_front();
+    if (out.crossplay != net::Crossplay() || (out.crossplay &&
+        !server_list::SameAddress(out.serverAddress, net::ServerAddress()))) return false;
     g_seen[out.id] = out;
     return true;
 }

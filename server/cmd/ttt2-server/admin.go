@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"ttt2-server/internal/config"
@@ -33,8 +34,8 @@ const (
 )
 
 var (
-	adminTimeout      = 10 * time.Second // reading the request, and each write of the answer
-	adminRefusalDelay = time.Second      // before a wrong token is answered (guessing stays slow)
+	adminTimeout      = func() *atomic.Int64 { v := new(atomic.Int64); v.Store(int64(10 * time.Second)); return v }() // reading the request, and each write of the answer
+	adminRefusalDelay = time.Second                                                                                   // before a wrong token is answered (guessing stays slow)
 )
 
 // startAdmin opens the admin port and writes its token file at path (stop: what quit does).
@@ -135,7 +136,7 @@ func adminBusy(c net.Conn) {
 // handleAdmin: the token line, then one command, answered on the connection.
 func handleAdmin(c net.Conn, token string, cmds *commands, stop func(), logger *log.Logger) {
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(adminTimeout))
+	c.SetDeadline(time.Now().Add(time.Duration(adminTimeout.Load())))
 	r := bufio.NewReaderSize(c, maxAdminLine)
 	got, err := adminLine(r)
 	if err != nil {
@@ -174,7 +175,7 @@ func adminLine(r *bufio.Reader) (string, error) {
 type deadlineWriter struct{ c net.Conn }
 
 func (w deadlineWriter) Write(b []byte) (int, error) {
-	w.c.SetWriteDeadline(time.Now().Add(adminTimeout))
+	w.c.SetWriteDeadline(time.Now().Add(time.Duration(adminTimeout.Load())))
 	return w.c.Write(b)
 }
 

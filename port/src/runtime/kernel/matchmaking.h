@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <utility>
 #include <vector>
+#include <string>
 
 namespace mm {
 
@@ -15,6 +16,8 @@ struct Context { uint32_t id = 0, value = 0; };
 
 struct SessionRecord
 {
+    bool crossplay = false;
+    std::string serverAddress, roomCode;
     uint64_t id = 0;                    // XNKID
     uint64_t hostPeer = 0;              // transport peer id of the host
     uint64_t hostXuid = 0;              // the host's online XUID (invites name the inviter)
@@ -30,6 +33,11 @@ struct SessionRecord
 };
 constexpr uint32_t kNetcodeKnown = 0x80000000u;
 
+void ClearSeen();
+void QueueInvite(const SessionRecord& record);
+void AdvertiseInvite(const SessionRecord& record);
+void HideSocialRooms();
+bool TakeSteamInvite(SessionRecord& record);
 void Publish(const SessionRecord& record);     // add or update (host)
 void Remove(uint64_t id);
 // Sessions of other hosts, newest first, at most `max`.

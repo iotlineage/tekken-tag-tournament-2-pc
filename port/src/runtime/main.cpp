@@ -98,6 +98,12 @@ int main(int argc, char** argv)
     // The Steam helper process (kernel/steam_bridge.cpp): Steam lives there so Steam Input does
     // not hide the controllers from the game. Nothing of the game starts in it.
     if (argc >= 2 && std::strcmp(argv[1], "--steam-bridge") == 0) return steamnet::RunBridge(argc, argv);
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "+connect_lobby") != 0) continue;
+        char* end = nullptr;
+        const auto lobby = std::strtoull(argv[++i], &end, 10);
+        if (end && !*end && lobby) steamnet::RequestJoinLobby(lobby);
+    }
     if (argc >= 4 && std::strcmp(argv[1], "--translate") == 0)
     {
         extern int GpuTranslateFile(const char* kind, const char* path);

@@ -74,7 +74,7 @@ std::vector<uint8_t> Unhex(const char* s)
 // A session record's id (matchmaking.cpp: u32 magic "SES2", u64 id little-endian); 0 when it is not one.
 uint64_t SessionOf(const std::vector<uint8_t>& rec)
 {
-    if (rec.size() < 12 || rec[0] != 'S' || rec[1] != 'E' || rec[2] != 'S' || rec[3] != '2') return 0;
+    if (rec.size() < 12 || rec[0] != 'S' || rec[1] != 'E' || rec[2] != 'S' || (rec[3] != '2' && rec[3] != '3')) return 0;
     uint64_t id = 0;
     for (int i = 0; i < 8; ++i) id |= uint64_t(rec[4 + i]) << (8 * i);
     return id;
@@ -184,8 +184,12 @@ void ReportPeers()
 void WriteLobbyData(uint64_t lobby, const std::vector<uint8_t>& record)
 {
     CSteamID id(static_cast<uint64>(lobby));
-    SteamMatchmaking()->SetLobbyData(id, "proto", Protocol());
+    const std::string protocol = std::string(Protocol()) + (record.size() >= 4 && record[3] == '3' ? "-crossplay" : "");
+    SteamMatchmaking()->SetLobbyData(id, "proto", protocol.c_str());
     SteamMatchmaking()->SetLobbyData(id, "rec", Hex(record).c_str());
+    const auto connect = "+connect_lobby " + std::to_string(lobby);
+    SteamFriends()->SetRichPresence("connect", connect.c_str());
+    SteamFriends()->SetRichPresence("status", record.size() >= 4 && record[3] == '3' ? "Cross-platform room" : "Steam-only room");
 }
 
 // Service thread: callbacks, call results, packets.
@@ -278,6 +282,16 @@ void Service()
                 SteamMatchmaking()->RequestLobbyData(j->m_steamIDLobby);
                 std::fprintf(stderr, "[steam] Join Game request received\n");
             }
+            else if (cb.m_iCallback == GameRichPresenceJoinRequested_t::k_iCallback)
+            {
+                const auto* j = reinterpret_cast<const GameRichPresenceJoinRequested_t*>(cb.m_pubParam);
+                constexpr char prefix[] = "+connect_lobby ";
+                if (std::strncmp(j->m_rgchConnect, prefix, sizeof(prefix)-1) == 0) {
+                    char* end = nullptr;
+                    const auto lobby = std::strtoull(j->m_rgchConnect + sizeof(prefix)-1, &end, 10);
+                    if (end && !*end) RequestJoinLobby(lobby);
+                }
+            }
             else if (cb.m_iCallback == LobbyDataUpdate_t::k_iCallback)
             {
                 const auto* u = reinterpret_cast<const LobbyDataUpdate_t*>(cb.m_pubParam);
@@ -287,7 +301,7 @@ void Service()
                 {
                     const CSteamID lobby(static_cast<uint64>(g_joinLobby));
                     const char* proto = SteamMatchmaking()->GetLobbyData(lobby, "proto");
-                    if (proto && std::strcmp(proto, Protocol()) == 0)
+                    if (proto && (std::strcmp(proto, Protocol()) == 0 || std::string(proto) == std::string(Protocol()) + "-crossplay"))
                     {
                         g_joinRecord = Unhex(SteamMatchmaking()->GetLobbyData(lobby, "rec"));
                         g_joinReady = !g_joinRecord.empty();
@@ -422,6 +436,10 @@ void RemoveLobby(uint64_t sessionId)
     if (it == g_hosted.end()) return;
     if (it->second.lobby) { SteamMatchmaking()->LeaveLobby(CSteamID(static_cast<uint64>(it->second.lobby))); g_hosted.erase(it); }
     else it->second.removed = true;                       // leave once the creation completes
+    SteamFriends()->SetRichPresence("connect", nullptr);
+    SteamFriends()->SetRichPresence("status", nullptr);
+    for (const auto& [sid, hosted] : g_hosted)
+        if (hosted.lobby && !hosted.removed) { WriteLobbyData(hosted.lobby, hosted.record); break; }
 }
 
 std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
@@ -448,6 +466,15 @@ std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
     }
     std::fprintf(stderr, "[steam] lobby list: %u lobbies, %zu sessions\n", list.m_nLobbiesMatching, out.size());
     return out;
+}
+
+void RequestJoinLobby(uint64_t lobby)
+{
+    const CSteamID id(static_cast<uint64>(lobby));
+    if (!g_running || !id.IsValid() || !id.IsLobby()) return;
+    std::lock_guard l(g_mutex);
+    g_joinLobby = lobby; g_joinReady = false;
+    SteamMatchmaking()->RequestLobbyData(id);
 }
 
 bool TakeJoinRequest(std::vector<uint8_t>& record)
@@ -481,6 +508,12 @@ bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handl
     }
     handle = h;
     return true;
+}
+
+void PlayedWith(uint64_t peer)
+{
+    const CSteamID id(static_cast<uint64>(peer));
+    if (g_running && peer != g_local && id.IsValid() && id.BIndividualAccount()) SteamFriends()->SetPlayedWith(id);
 }
 
 void CancelTicket(uint32_t handle)
@@ -546,8 +579,10 @@ void PublishLobby(uint64_t, const std::vector<uint8_t>&) {}
 void RemoveLobby(uint64_t) {}
 std::vector<std::vector<uint8_t>> ListLobbies(int, int) { return {}; }
 bool TakeJoinRequest(std::vector<uint8_t>&) { return false; }
+void RequestJoinLobby(uint64_t) {}
 bool WebApiTicket(const std::string&, std::string&, uint32_t&, int) { return false; }
 void CancelTicket(uint32_t) {}
+void PlayedWith(uint64_t) {}
 std::vector<FriendInfo> Friends() { return {}; }
 bool InviteToSession(uint64_t, uint64_t) { return false; }
 } // namespace steamnet::direct

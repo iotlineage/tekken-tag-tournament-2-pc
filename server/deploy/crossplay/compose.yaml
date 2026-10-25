@@ -1,0 +1,17 @@
+# Linux host networking keeps coturn's UDP port range and advertised addresses consistent.
+services:
+  server:
+    build:
+      context: ../..
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./local:/srv/ttt2
+  relay:
+    user: "65532:65532"
+    image: coturn/coturn:4.6.3@sha256:71c3c990283385567f11794ee692e3a47b66fd9b0bb39e42afbe776e331dd888
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./local/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]

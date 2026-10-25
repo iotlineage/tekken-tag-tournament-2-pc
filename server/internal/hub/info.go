@@ -146,6 +146,9 @@ func (h *Hub) infoReply(nonce uint64, limit int) []byte {
 		if h.verifier != nil {
 			flags |= 2
 		}
+		if cfg.Crossplay {
+			flags |= 4
+		}
 		w.U8(flags)
 		w.Str(trim(cfg.Name, 64))
 		w.Str(cfg.Region)

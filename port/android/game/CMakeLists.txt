@@ -61,7 +61,7 @@ include("${port_root}/cmake/KernelStubs.cmake")
 ttt2_generate_kernel_stubs(stubs "${ppc_dir}" "${runtime}")
 
 file(GLOB kernel_sources CONFIGURE_DEPENDS "${runtime}/kernel/*.cpp")
-foreach(excluded data_watch.cpp diag_hooks.cpp steam_bridge.cpp
+foreach(excluded crossplay_net.cpp data_watch.cpp diag_hooks.cpp steam_bridge.cpp
                  steam_bridge_linux.cpp host_settings_windows.cpp)
     list(REMOVE_ITEM kernel_sources "${runtime}/kernel/${excluded}")
 endforeach()
@@ -139,3 +139,6 @@ target_link_libraries(ttt2_android_game PRIVATE
 
 # Small independent JNI library: setup does not initialize SDL or the game VM.
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../setup" "setup")
+
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/Crossplay.cmake")
+ttt2_enable_crossplay(ttt2_android_game)

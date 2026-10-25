@@ -1,5 +1,6 @@
 dist
 data
 server.toml
+deploy/crossplay/local
 *.exe
 ttt2-server

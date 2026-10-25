@@ -27,10 +27,10 @@ namespace {
 // server/PROTOCOL.md
 enum : uint8_t { kHello = 1, kAuth = 2, kPing = 3, kSessionPut = 4, kSessionDel = 5, kSessionList = 6, kSessionGet = 7, kInviteSend = 8,
                  kGinRequest = 9, kStatsWrite = 10, kStatsBoard = 11, kStatsPlayers = 12, kArbRegister = 13, kPeerCheck = 14, kXuidNames = 15,
-                 kMatchEvent = 16, kFilePut = 17, kFileGet = 18,
+                 kMatchEvent = 16, kFilePut = 17, kFileGet = 18, kRoomJoin = 19, kRoomLeave = 20, kSignal = 21, kRelayRequest = 22,
                  kWelcome = 101, kError = 102, kPong = 103, kListResult = 104, kGetResult = 105, kInvite = 106,
                  kNotice = 109, kGinResponse = 110, kStatsResult = 111, kPeerResult = 112, kNamesResult = 113,
-                 kFileResult = 114 };
+                 kFileResult = 114, kRoomResult = 115, kSignalRecv = 116, kRoomPeers = 117, kRelayCredentials = 118, kDiscoveryPeer = 119 };
 enum : uint8_t { kInfoReq = 1, kInfo = 2 };
 constexpr uint32_t kInfoMagic = 0x49535454;     // "TTSI" little-endian
 constexpr size_t kInfoReqMinSize = 128;
@@ -207,6 +207,14 @@ struct Client::Impl
     std::map<uint32_t, std::pair<bool, std::vector<uint8_t>>> gets;
     std::map<uint32_t, std::vector<uint8_t>> gins;  // GIN responses by request
     std::map<uint32_t, std::pair<bool, StatPage>> statPages;   // statistics answers by request
+    bool relayReady = false;
+    std::string relayUser, relayPassword;
+    std::map<uint32_t, bool> roomAnswers;
+    std::map<uint64_t, std::string> roomCodes;
+    std::set<uint64_t> wantedRooms;
+    std::map<uint64_t, std::chrono::steady_clock::time_point> discovery;
+    std::map<uint64_t, std::map<uint64_t, uint64_t>> rooms;
+    std::deque<std::pair<uint64_t, std::vector<uint8_t>>> signals;
     std::map<uint32_t, uint8_t> peerAnswers;   // PEER_RESULT by request
     std::map<uint32_t, std::map<uint64_t, std::string>> nameAnswers;   // XUID_NAMES_RESULT by request
     std::map<uint32_t, std::pair<uint8_t, std::vector<uint8_t>>> fileAnswers;   // FILE_RESULT by request
@@ -322,6 +330,55 @@ struct Client::Impl
             if (!outstanding.count(request)) break;
             fileAnswers[request] = { found, std::move(data) };
             reqCv.notify_all();
+            break;
+        }
+        case kRelayCredentials:
+        {
+            auto user = r.Str(128), password = r.Str(128);
+            if (!r.ok() || r.n) { Close("malformed relay credentials"); return; }
+            std::lock_guard l(reqMutex);
+            relayUser = std::move(user); relayPassword = std::move(password); relayReady = true;
+            break;
+        }
+        case kRoomResult:
+        {
+            const uint32_t id = r.U32(); const uint8_t ok = r.U8();
+            if (!r.ok() || r.n || ok > 1) { Close("malformed room admission"); return; }
+            std::lock_guard l(reqMutex);
+            if (outstanding.count(id)) roomAnswers[id] = ok != 0;
+            reqCv.notify_all();
+            break;
+        }
+        case kDiscoveryPeer:
+        {
+            const auto peer = r.U64(); const auto seconds = r.U8();
+            if (!r.ok() || r.n || seconds > 30 || peer >> 48 != 0x4350) { Close("malformed discovery lease"); return; }
+            std::lock_guard l(reqMutex);
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = discovery.begin(); it != discovery.end();)
+                if (it->second <= now) it = discovery.erase(it); else ++it;
+            if (!seconds) discovery.erase(peer);
+            else if (discovery.count(peer) || discovery.size() < 128) discovery[peer] = now + std::chrono::seconds(seconds);
+            break;
+        }
+        case kRoomPeers:
+        {
+            const uint64_t room = r.U64(); const uint8_t count = r.U8(); const auto code = r.Str(32);
+            if (count > 32) { Close("oversized room roster"); return; }
+            std::map<uint64_t, uint64_t> members;
+            for (unsigned i = 0; i < count; ++i) { const auto id = r.U64(); members[id] = r.U64(); }
+            if (!r.ok() || r.n) { Close("malformed room roster"); return; }
+            std::lock_guard l(reqMutex);
+            if (count == 0) { rooms.erase(room); roomCodes.erase(room); }
+            else if (wantedRooms.count(room) && (rooms.count(room) || rooms.size() < 4)) { rooms[room] = std::move(members); roomCodes[room] = code; }
+            break;
+        }
+        case kSignalRecv:
+        {
+            const uint64_t from = r.U64(); auto data = r.Blob(16384);
+            if (!r.ok() || r.n) { Close("malformed connection signal"); return; }
+            std::lock_guard l(reqMutex);
+            if (signals.size() < 128) signals.emplace_back(from, std::move(data));
             break;
         }
         case kPeerResult:
@@ -447,11 +504,15 @@ struct Client::Impl
 
     void TimerLoop()
     {
-        int64_t nextKeepAlive = 0;
+        int64_t nextKeepAlive = 0, nextRelayRefresh = NowUs() + 6LL * 3600 * 1'000'000;
         while (!stopping)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             const int64_t now = NowUs();
+            if (opts.crossplay && connected && now >= nextRelayRefresh) {
+                Queue(kRelayRequest, {});
+                nextRelayRefresh = now + 6LL * 3600 * 1'000'000;
+            }
             if (now >= nextKeepAlive && connected)
             {
                 nextKeepAlive = now + 5'000'000;     // the server drops a connection quiet for 30 s
@@ -507,6 +568,7 @@ Client::~Client() { Disconnect(); }
 
 bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
 {
+    welcome = {};
     Impl& m = *impl_;
     if (m.used) { error = "a client connects once"; return false; }
     m.used = true;
@@ -555,15 +617,21 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
     const std::string identity = "ttt2-" + Base64Url(fingerprintBytes, 19);
 
     Writer hello;
-    hello.U16(kProtocolVersion);
+    hello.U16(opts.crossplay ? 3 : kProtocolVersion);
     hello.Str(opts.gameProtocol);
     hello.Str(opts.clientVersion);
     Writer auth;
-    auth.U64(opts.steamId);
+    auth.U64(opts.crossplay ? 0 : opts.steamId);
     auth.Str(opts.profileName);
     const std::string ticket = opts.ticket ? opts.ticket(identity) : std::string();
-    auth.Blob(std::vector<uint8_t>(ticket.begin(), ticket.end()));
+    const std::string credential = opts.crossplay && opts.loadCredential ? opts.loadCredential(fingerprint) : std::string();
+    const std::string& proof = opts.crossplay ? credential : ticket;
+    auth.Blob(std::vector<uint8_t>(proof.begin(), proof.end()));
     auth.Str(opts.password);
+    if (opts.crossplay) {
+        auth.U64(ticket.empty() ? 0 : opts.steamId);
+        auth.Blob(std::vector<uint8_t>(ticket.begin(), ticket.end()));
+    }
     auto frame = [](uint8_t type, const std::vector<uint8_t>& p) {
         std::vector<uint8_t> f(5 + p.size());
         const uint32_t size = uint32_t(1 + p.size());
@@ -605,13 +673,24 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
     welcome.name = Clean(r.Str(256), 64);
     welcome.region = Clean(r.Str(64), 32);
     welcome.motd = Clean(r.Str(4096), 1000);
-    if (type != kWelcome || !r.ok() || welcome.peer != opts.steamId)
+    std::string issued;
+    welcome.crossplay = opts.crossplay;
+    if (opts.crossplay) {
+        issued = r.Str(128); welcome.steamId = r.U64();
+        welcome.stunServer = r.Str(1024); welcome.turnServer = r.Str(1024);
+        welcome.turnUser = r.Str(256); welcome.turnPassword = r.Str(256);
+    }
+    if (type != kWelcome || !r.ok() || r.n ||
+        (opts.crossplay ? (welcome.peer >> 48 != 0x4350 || issued.empty()) : welcome.peer != opts.steamId))
     {
         error = "the server's answer was not understood";
         m.tls.Close();
         return false;
     }
     if (pin == Pin::New && !opts.knownServersFile.empty()) SavePin(opts.knownServersFile, server, fingerprint);
+    if (opts.crossplay && opts.saveCredential && !opts.saveCredential(fingerprint, issued)) {
+        error = "Could not save the community account credential."; m.tls.Close(); return false;
+    }
     m.peer = welcome.peer;
     m.connected = true;
     m.reader = std::thread([&m] { m.ReaderLoop(); });
@@ -662,6 +741,12 @@ std::string Client::CloseReason() const
 void Client::PublishSession(const std::vector<uint8_t>& record)
 {
     if (!Connected() || record.size() > kMaxRecord) return;
+    if (Crossplay() && record.size() >= 12) {
+        uint64_t room = 0;
+        for (int i = 0; i < 8; ++i) room |= uint64_t(record[4+i]) << (8*i);
+        std::lock_guard l(impl_->reqMutex);
+        if (impl_->wantedRooms.size() < 4) impl_->wantedRooms.insert(room);
+    }
     Writer w;
     w.Blob(record);
     impl_->Queue(kSessionPut, w.b);
@@ -669,6 +754,7 @@ void Client::PublishSession(const std::vector<uint8_t>& record)
 
 void Client::RemoveSession(uint64_t id)
 {
+    { std::lock_guard l(impl_->reqMutex); impl_->wantedRooms.erase(id); impl_->rooms.erase(id); impl_->roomCodes.erase(id); }
     if (!Connected()) return;
     Writer w;
     w.U64(id);
@@ -777,6 +863,83 @@ void Client::WriteStats(uint64_t sessionId, uint64_t ownXuid, uint64_t subjectXu
         }
     }
     impl_->Queue(kStatsWrite, w.b);
+}
+
+bool Client::Crossplay() const { return impl_->opts.crossplay; }
+
+bool Client::TakeRelayCredentials(std::string& user, std::string& password) {
+    std::lock_guard l(impl_->reqMutex);
+    if (!impl_->relayReady) return false;
+    user = impl_->relayUser; password = impl_->relayPassword; impl_->relayReady = false;
+    return true;
+}
+
+bool Client::JoinRoom(uint64_t room, int timeoutMs, const std::string& code)
+{
+    if (!Connected() || !Crossplay()) return false;
+    Impl& m = *impl_;
+    uint32_t id;
+    { std::lock_guard l(m.reqMutex);
+      if (!m.wantedRooms.count(room) && m.wantedRooms.size() >= 4) return false;
+      m.wantedRooms.insert(room); id = m.nextRequest++; m.outstanding.insert(id); }
+    Writer w; w.U32(id); w.U64(room); w.Str(code); m.Queue(kRoomJoin, w.b);
+    std::unique_lock l(m.reqMutex);
+    m.reqCv.wait_for(l, std::chrono::milliseconds(timeoutMs), [&] { return m.roomAnswers.count(id) || !m.connected; });
+    m.outstanding.erase(id);
+    const auto it = m.roomAnswers.find(id);
+    bool ok = it != m.roomAnswers.end() && it->second;
+    if (it != m.roomAnswers.end()) m.roomAnswers.erase(it);
+    l.unlock();
+    if (!ok) LeaveRoom(room); // also cancels a late admission after a timeout
+    return ok;
+}
+
+std::string Client::RoomCode(uint64_t room) const {
+    std::lock_guard l(impl_->reqMutex);
+    const auto it = impl_->roomCodes.find(room);
+    return it == impl_->roomCodes.end() ? std::string() : it->second;
+}
+
+void Client::LeaveRoom(uint64_t room)
+{
+    if (!Crossplay()) return;
+    { std::lock_guard l(impl_->reqMutex); impl_->wantedRooms.erase(room); impl_->rooms.erase(room); impl_->roomCodes.erase(room); }
+    Writer w; w.U64(room); impl_->Queue(kRoomLeave, w.b);
+}
+
+std::map<uint64_t, uint64_t> Client::RoomPeers() const
+{
+    std::map<uint64_t, uint64_t> result;
+    if (!Connected()) return result;
+    std::lock_guard l(impl_->reqMutex);
+    for (const auto& [room, peers] : impl_->rooms) result.insert(peers.begin(), peers.end());
+    result.erase(LocalPeer());
+    return result;
+}
+
+std::map<uint64_t, uint64_t> Client::ConnectionPeers() const
+{
+    auto result = RoomPeers();
+    if (!Connected()) return {};
+    std::lock_guard l(impl_->reqMutex);
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& [peer, until] : impl_->discovery) if (now < until) result.emplace(peer, 0);
+    result.erase(LocalPeer());
+    return result;
+}
+
+bool Client::SendSignal(uint64_t peer, const void* data, size_t size)
+{
+    if (!Connected() || !Crossplay() || !data || !size || size > 16384) return false;
+    Writer w; w.U64(peer); w.U32(uint32_t(size)); w.Raw(data, size); impl_->Queue(kSignal, w.b); return true;
+}
+
+bool Client::TakeSignal(uint64_t& peer, std::vector<uint8_t>& data)
+{
+    std::lock_guard l(impl_->reqMutex);
+    if (impl_->signals.empty()) return false;
+    peer = impl_->signals.front().first; data = std::move(impl_->signals.front().second);
+    impl_->signals.pop_front(); return true;
 }
 
 int Client::PeerOnServer(uint64_t peer, int timeoutMs)
@@ -988,6 +1151,7 @@ bool ParseInfo(const uint8_t* data, size_t size, uint64_t nonce, ServerInfo& inf
     const uint8_t flags = r.U8();
     out.password = (flags & 1) != 0;
     out.verified = (flags & 2) != 0;
+    out.crossplay = (flags & 4) != 0;
     out.name = Clean(r.Str(256), 64);
     out.region = Clean(r.Str(256), 32);
     out.online = r.U16();

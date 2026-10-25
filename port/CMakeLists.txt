@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(tekken_recomp C CXX)
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/Crossplay.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/ShaderBuildId.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/KernelStubs.cmake")
 
@@ -110,7 +111,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         "${TTT2_RENDERER_PPC_DIR}" "${TTT2_RENDERER_XENON_UTILS}"
         "${TTT2_RENDERER_SIMDE_DIR}" src/runtime src/runtime/kernel)
     file(GLOB TTT2_KERNEL_LINUX "${CMAKE_SOURCE_DIR}/src/runtime/kernel/*.cpp")
-    foreach(_excluded data_watch.cpp diag_hooks.cpp steam_bridge.cpp
+    foreach(_excluded crossplay_net.cpp data_watch.cpp diag_hooks.cpp steam_bridge.cpp
                       host_settings_windows.cpp gpu_render.cpp xma.cpp)
         list(REMOVE_ITEM TTT2_KERNEL_LINUX
             "${CMAKE_SOURCE_DIR}/src/runtime/kernel/${_excluded}")
@@ -129,6 +130,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(ttt2_shared_kernel_linux PRIVATE
         TTT2_LOCAL_SAVES=1 TTT2_HAVE_STEAM=${_ttt2_linux_have_steam} TTT2_GPU_HW_BACKEND=1
         TTT2_GPU_HW_D3D11=1 TTT2_D3D11_MOVIE_BACKEND=1)
+    ttt2_enable_crossplay(ttt2_shared_kernel_linux)
     target_link_libraries(ttt2_shared_kernel_linux PRIVATE SDL3::SDL3 OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
     if(TTT2_LINUX_STEAM)
         target_include_directories(ttt2_shared_kernel_linux PRIVATE
@@ -297,6 +299,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
             set_property(SOURCE src/runtime/skin_profile.cpp APPEND PROPERTY
                 COMPILE_OPTIONS -mssse3)
         endif()
+        ttt2_enable_crossplay(tekken_recomp_linux)
         target_link_libraries(tekken_recomp_linux PRIVATE
             ttt2_host_window_game_sdl ttt2_host_input_sdl
             SDL3::SDL3 ttt2_ffmpeg ttt2_linux_ppc
@@ -394,7 +397,7 @@ add_subdirectory(third_party/ffmpeg_xma)
 # The runtime executable: minimal host (memory, function table, entry) + kernel import stubs.
 file(GLOB RUNTIME_KERNEL "${CMAKE_SOURCE_DIR}/src/runtime/kernel/*.cpp")
 foreach(_excluded diag_hooks_linux.cpp host_settings_linux.cpp
-                  steam_bridge_linux.cpp steam_bridge_linux_stub.cpp)
+                  steam_bridge_linux.cpp steam_bridge_linux_stub.cpp crossplay_net.cpp)
     list(REMOVE_ITEM RUNTIME_KERNEL "${CMAKE_SOURCE_DIR}/src/runtime/kernel/${_excluded}")
 endforeach()
 add_executable(tekken_recomp
@@ -432,6 +435,7 @@ target_compile_definitions(tekken_recomp PRIVATE TTT2_D3D11_MOVIE_BACKEND=1)
 # Hardware renderer (gpu_hw_d3d11.h); still opt-in at run time with TTT2_GPU_HW=1 / compare.
 target_compile_definitions(tekken_recomp PRIVATE TTT2_GPU_HW_BACKEND=1)
 target_compile_definitions(tekken_recomp PRIVATE TTT2_GPU_HW_D3D11=1)
+ttt2_enable_crossplay(tekken_recomp)
 target_link_libraries(tekken_recomp PRIVATE SDL3::SDL3 d3d11 dxgi d3dcompiler)
 add_custom_command(TARGET tekken_recomp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:SDL3::SDL3>"

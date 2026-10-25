@@ -31,6 +31,7 @@ void RemoveLobby(uint64_t sessionId);
 std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs);
 // A friend's "Join Game" (GameLobbyJoinRequested_t): the lobby's record, once.
 bool TakeJoinRequest(std::vector<uint8_t>& record);
+void RequestJoinLobby(uint64_t lobby);
 // The room's Friend Invite: the player's online friends (those in this game first, then by name; at most 200), and an
 // invite of one of them into the Steam lobby of session `sessionId` (hosted here, or found in a lobby search / a Join
 // Game) - false when Steam does not run or the lobby is not known.
@@ -41,6 +42,7 @@ bool InviteToSession(uint64_t sessionId, uint64_t friendId, int timeoutMs);
 // it with Steam (COMMUNITY_SERVER_PLAN.md 7b). `handle` cancels it once the server has checked it.
 bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handle, int timeoutMs);
 void CancelTicket(uint32_t handle);
+void PlayedWith(uint64_t peer);
 
 // The calls above run Steam in a HELPER PROCESS (steam_bridge.cpp on Windows,
 // steam_bridge_linux.cpp on Linux): this exe started again as
@@ -62,8 +64,10 @@ void PublishLobby(uint64_t sessionId, const std::vector<uint8_t>& record);
 void RemoveLobby(uint64_t sessionId);
 std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs);
 bool TakeJoinRequest(std::vector<uint8_t>& record);
+void RequestJoinLobby(uint64_t lobby);
 bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handle, int timeoutMs);
 void CancelTicket(uint32_t handle);
+void PlayedWith(uint64_t peer);
 std::vector<FriendInfo> Friends();
 bool InviteToSession(uint64_t sessionId, uint64_t friendId);
 } // namespace direct

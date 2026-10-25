@@ -13,6 +13,7 @@
 //    that trusts unverified IDs (two instances on one PC). Server keys are pinned in
 //    %LOCALAPPDATA%\TTT2Recomp\community\known_servers.txt (TTT2_KNOWN_SERVERS = another file, for tests).
 #pragma once
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -21,6 +22,8 @@
 namespace community { class Client; struct Welcome; }
 
 namespace net {
+// Serialize room creation with a network change so identities cannot switch mid-create.
+std::unique_lock<std::mutex> LockSessionNetwork();
 
 // Channels: reliable ordered (stream sockets, session control) or unreliable (datagrams).
 enum class Channel : uint8_t { Unreliable = 0, Reliable = 1 };
@@ -30,8 +33,12 @@ using Receiver = void (*)(uint64_t fromPeer, Channel channel, const uint8_t* dat
 // Starts the backend once (idempotent); packets arrive on its own thread through `receiver`.
 bool Start(Receiver receiver);
 uint64_t LocalPeer();                   // 0 before Start
+uint64_t ProfilePeer();                 // stable across server/network switches
 bool Send(uint64_t peer, Channel channel, const void* data, size_t size);
 const char* BackendName();
+bool Crossplay();
+std::string ServerAddress();
+uint64_t SteamPeer(uint64_t peer); // verified Steam binding, or 0
 
 // The game's online protocol: only games of the same one meet (Steam lobbies, community servers).
 const char* GameProtocol();

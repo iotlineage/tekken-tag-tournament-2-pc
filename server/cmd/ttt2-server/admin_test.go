@@ -175,9 +175,9 @@ func TestAdminPortCommands(t *testing.T) {
 }
 
 func TestAdminPortLimits(t *testing.T) {
-	oldTimeout := adminTimeout
-	adminTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { adminTimeout = oldTimeout })
+	oldTimeout := adminTimeout.Load()
+	adminTimeout.Store(int64(300 * time.Millisecond))
+	t.Cleanup(func() { adminTimeout.Store(oldTimeout) })
 	s := startAdminServer(t)
 	// connections that send nothing hold the slots until their deadline; one more is turned away
 	var idle []net.Conn

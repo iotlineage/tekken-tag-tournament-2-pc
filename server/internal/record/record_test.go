@@ -80,3 +80,20 @@ func FuzzCheck(f *testing.F) {
 		}
 	})
 }
+
+func TestCrossplayRecord(t *testing.T) {
+	rec := build(42, host, 42, host, 0, 0, 0, true)
+	rec[3] = '3'
+	w := wire.Writer{B: rec}
+	w.Str("server.example:28200")
+	w.Str("")
+	s, err := Check(w.B, host)
+	if err != nil || !s.Crossplay {
+		t.Fatal(s, err)
+	}
+	for _, bad := range [][]byte{rec, w.B[:len(w.B)-1], append(append([]byte{}, w.B...), 1)} {
+		if _, err := Check(bad, host); err == nil {
+			t.Fatal("accepted malformed crossplay tail")
+		}
+	}
+}

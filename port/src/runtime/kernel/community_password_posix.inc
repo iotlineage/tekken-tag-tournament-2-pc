@@ -1,7 +1,9 @@
 // Per-installation AES-GCM key in the application's private save directory (0600).
-// Android's save directory is app-private; Linux uses the owning user's data directory.
+// Android supplies its internal files directory; Linux uses the owning user's data directory.
 bool PasswordKey(unsigned char (&key)[32]) {
-    auto path = std::filesystem::path(FilePath()); std::error_code ec;
+    const char* privateDir = std::getenv("TTT2_COMMUNITY_PRIVATE_DIR");
+    auto path = privateDir && *privateDir ? std::filesystem::path(privateDir) / "servers.ini" : std::filesystem::path(FilePath());
+    std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     path += ".key";
     int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);

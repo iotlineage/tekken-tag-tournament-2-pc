@@ -7,6 +7,9 @@
 #include "../host_storage.h"
 #include "net_transport.h"
 #include "community_net.h"
+#include "crossplay_net.h"
+#include "server_list.h"
+#include "matchmaking.h"
 #include "profiles.h"
 #include "steam_net.h"
 #include "title_server.h"
@@ -25,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+bool XSessionAnyActive();
 bool SessionEnabled();   // rollback_session.cpp: rollback sessions (TTT2_ROLLBACK)
 
 namespace net {
@@ -39,11 +43,16 @@ std::atomic<uint64_t> g_local{ 0 };
 host_udp::Socket* g_socket = nullptr;
 Receiver g_receiver = nullptr;
 bool g_steam = false;
+uint64_t g_basePeer = 0;
+std::atomic<bool> g_crossplay{false};
+std::string g_serverAddress;
+std::mutex g_addressMutex;
 // The community server players find each other on (sessions, invites, GIN); matches still run over this
 // transport (Steam P2P). std::atomic_load / _store: matchmaking reads it from the game's threads.
 std::shared_ptr<community::Client> g_server;
 std::atomic<bool> g_serverActive{ false };
 std::mutex g_serverMutex;                                   // one connect / disconnect at a time
+std::mutex g_sessionNetworkMutex;
 
 // While a community server is the network, direct traffic is taken only from that server's players (the user: "when
 // I join a server I play with the people on that server only"): a peer's first packet is held while the server is
@@ -182,7 +191,13 @@ void Deliver(uint64_t peer, Channel channel, const uint8_t* data, size_t size)
 
 void FromSteam(uint64_t peer, bool reliable, const uint8_t* data, size_t size)
 {
-    Deliver(peer, reliable ? Channel::Reliable : Channel::Unreliable, data, size);
+    if (!g_crossplay.load()) Deliver(peer, reliable ? Channel::Reliable : Channel::Unreliable, data, size);
+}
+
+void FromCrossplay(uint64_t peer, bool reliable, const uint8_t* data, size_t size)
+{
+    // Crossplay has already authenticated the connection and checked room membership.
+    if (g_crossplay.load() && g_receiver) g_receiver(peer, reliable ? Channel::Reliable : Channel::Unreliable, data, size);
 }
 
 // Network conditions for tests (loopback only): TTT2_NET_DELAY=<ms one way>, TTT2_NET_JITTER=<ms,
@@ -270,7 +285,7 @@ void ReceiveLoop()
         if (n < 1) continue;
         const uint64_t peer = kLoopTag | fromPort;
         // First byte: the channel; the rest is the packet.
-        Deliver(peer, Channel(buffer[0] & 1), buffer.data() + 1, size_t(n - 1));
+        if (!g_crossplay.load()) Deliver(peer, Channel(buffer[0] & 1), buffer.data() + 1, size_t(n - 1));
     }
 }
 
@@ -296,11 +311,17 @@ bool LoginOptions(const std::string& address, const std::string& password, commu
                   std::string& error)
 {
     if (!community::ParseAddress(address, o.host, o.port)) { error = "That is not a server address."; return false; }
-    // The player is their Steam ID, proved with a Steam Web API ticket made for this server's identity
-    // (COMMUNITY_SERVER_PLAN.md 7b S2): the sessions the server lists name their hosts by it, and the game reaches
-    // them over Steam P2P as on Steam. TTT2_SERVER_TEST_ID (tests, on a server that trusts unverified IDs): the
-    // loopback transport's peer id instead - two instances on one PC, their matches over 127.0.0.1.
+    // Crossplay uses a server-issued account and optional verified Steam binding.
+    // Legacy community servers retain Steam identity/P2P, with the existing
+    // TTT2_SERVER_TEST_ID switch for local diagnostic peers.
     ticket = 0;
+    o.crossplay = crossplay::Available() && !std::getenv("TTT2_SERVER_TEST_ID") && !std::getenv("TTT2_SERVER_LEGACY");
+    const auto listed = server_list::Get(address);
+    if (listed.state == server_list::State::Answered && !listed.info.crossplay) o.crossplay = false;
+    if (o.crossplay) {
+        o.loadCredential = server_list::LoadCredential;
+        o.saveCredential = server_list::SaveCredential;
+    }
     if (!g_steam && std::getenv("TTT2_SERVER_TEST_ID")) o.steamId = g_local.load();
     else if (g_steam)
     {
@@ -316,7 +337,7 @@ bool LoginOptions(const std::string& address, const std::string& password, commu
             return hex;
         };
     }
-    else
+    else if (!o.crossplay)
     {
 #ifdef __ANDROID__
         error = "Community servers require a Steam authentication ticket and Steam P2P. This Android build has no supported Steamworks client or authenticated Steam bridge.";
@@ -339,7 +360,9 @@ bool ConnectServer(const std::string& address, const std::string& password, comm
                    std::string& error, int& refusal, uint64_t* banUntil)
 {
     std::lock_guard l(g_serverMutex);
+    auto lifecycle = LockSessionNetwork();
     refusal = community::RefusedNone;
+    if (XSessionAnyActive()) { error = "Leave the current room before changing networks."; return false; }
     if (banUntil) *banUntil = ~0ull;
     community::Options o;
     uint32_t ticket = 0;
@@ -355,10 +378,28 @@ bool ConnectServer(const std::string& address, const std::string& password, comm
         std::fprintf(stderr, "[net] community server %s: %s\n", address.c_str(), error.c_str());
         return false;
     }
+    if (XSessionAnyActive()) {
+        client->Disconnect(); error = "Leave the current room before changing networks."; return false;
+    }
+    g_crossplay = false;
+    crossplay::Stop();
+    if (welcome.crossplay && !crossplay::Start(client, welcome, FromCrossplay, error)) {
+        client->Disconnect();
+        auto old = std::atomic_exchange(&g_server, std::shared_ptr<community::Client>());
+        if (old) old->Disconnect();
+        g_local = g_basePeer; g_serverActive = false;
+        { std::lock_guard a(g_addressMutex); g_serverAddress.clear(); }
+        mm::ClearSeen();
+        return false;
+    }
     std::shared_ptr<community::Client> old = std::atomic_exchange(&g_server, client);
+    { std::lock_guard a(g_addressMutex); g_serverAddress = address; }
+    g_local = welcome.crossplay ? welcome.peer : g_basePeer;
+    g_crossplay = welcome.crossplay;
     g_serverActive = true;
+    mm::ClearSeen();
     if (old) old->Disconnect();
-    std::fprintf(stderr, "[net] network: community server %s (matches over %s)\n", address.c_str(), g_steam ? "Steam P2P" : "loopback");
+    std::fprintf(stderr, "[net] network: community server %s (matches over %s)\n", address.c_str(), welcome.crossplay ? "GameNetworkingSockets" : g_steam ? "Steam P2P" : "loopback");
     TitleServerShareOwnFiles(client);   // this player's license, for the others to view
     return true;
 }
@@ -367,6 +408,9 @@ int ProbeServer(const std::string& address, const std::string& password, uint64_
 {
     std::lock_guard l(g_serverMutex);
     banUntil = ~0ull;
+    // A second login with this account would evict the live connection.
+    if (const auto current = Community(); current && current->Connected() &&
+        server_list::SameAddress(address, ServerAddress())) return 1;
     community::Options o;
     uint32_t ticket = 0;
     std::string error;
@@ -389,8 +433,15 @@ int ProbeServer(const std::string& address, const std::string& password, uint64_
 void DisconnectServer()
 {
     std::lock_guard l(g_serverMutex);
+    auto lifecycle = LockSessionNetwork();
+    if (XSessionAnyActive()) return;
+    g_crossplay = false;
+    crossplay::Stop();
+    g_local = g_basePeer;
+    { std::lock_guard a(g_addressMutex); g_serverAddress.clear(); }
     std::shared_ptr<community::Client> old = std::atomic_exchange(&g_server, std::shared_ptr<community::Client>());
     g_serverActive = false;
+    mm::ClearSeen();
     if (!old) return;
     old->Disconnect();
     std::fprintf(stderr, "[net] network: %s\n", g_steam ? "Steam" : "loopback");
@@ -428,7 +479,7 @@ bool Start(Receiver receiver)
         if (steamnet::Start(FromSteam))
         {
             g_steam = true;
-            g_local = steamnet::LocalId();
+            g_local = g_basePeer = steamnet::LocalId();
             g_started = true;
             return true;
         }
@@ -439,7 +490,7 @@ bool Start(Receiver receiver)
     g_socket = host_udp::BindLoopback(kBasePort, 64, port);
     if (!g_socket) return false;
     g_receiver = receiver;
-    g_local = kLoopTag | port;
+    g_local = g_basePeer = kLoopTag | port;
     g_started = true;
     std::thread(ReceiveLoop).detach();
     std::fprintf(stderr, "[net] loopback transport on 127.0.0.1:%u (peer %016llX)\n", port,
@@ -447,11 +498,23 @@ bool Start(Receiver receiver)
     return true;
 }
 
+uint64_t ProfilePeer() { return g_basePeer; }
+bool Crossplay() { return g_crossplay.load(); }
+std::unique_lock<std::mutex> LockSessionNetwork() { return std::unique_lock(g_sessionNetworkMutex); }
+std::string ServerAddress() { std::lock_guard l(g_addressMutex); return g_serverAddress; }
+uint64_t SteamPeer(uint64_t peer) {
+    if (!g_crossplay.load()) return g_steam ? peer : 0;
+    const auto c = Community(); if (!c) return 0;
+    const auto peers = c->RoomPeers(); const auto it = peers.find(peer);
+    return it == peers.end() ? 0 : it->second;
+}
+
 uint64_t LocalPeer() { return g_local.load(); }
 const char* BackendName() { return g_serverActive.load() ? "server" : g_steam ? "steam" : "loopback"; }
 
 bool Send(uint64_t peer, Channel channel, const void* data, size_t size)
 {
+    if (g_crossplay.load()) return crossplay::Send(peer, channel == Channel::Reliable, data, size);
     if (g_steam) return steamnet::Send(peer, channel == Channel::Reliable, data, size);
     if (!g_started || (peer & 0xFFFFFFFF00000000ull) != kLoopTag || size + 1 > 65507) return false;
     thread_local std::vector<uint8_t> packet;

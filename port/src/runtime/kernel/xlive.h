@@ -12,6 +12,7 @@ constexpr uint32_t kTitleId = 0x4E4D0859u;
 bool Enabled();                         // LIVE emulation on (follows TitleServerEnabled)
 uint64_t LocalPeerId();                 // this machine on the transport (net_transport.h; starts it)
 uint64_t OnlineXuid(uint32_t user = 0);  // user 0's (the profile's) or a guest's online XUID (0 when signed out)
+void RefreshTitleXnAddr(uint8_t* base); // main thread: refresh the title cache after a network switch
 void WriteOwnXnAddr(uint8_t* base, uint32_t xnaddr);   // our XNADDR (0x24 bytes)
 
 // Virtual addresses (host order) <-> peers: our own is 10.77.x.y (127.0.0.1 also means us), each

@@ -146,3 +146,18 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+func TestCrossplaySettings(t *testing.T) {
+	c, err := parse(t, `crossplay = true
+stun_server = "relay.example:3478"
+turn_server = "relay.example:3478"
+turn_secret = "secret"`)
+	if err != nil || c.CheckIdentity() != nil || !c.Crossplay {
+		t.Fatal(c, err)
+	}
+	for _, text := range []string{`turn_server = "relay:3478"`, `turn_secret = "secret"`, `stun_server = "bad,host:3478"`, `stun_server = "host:0"`} {
+		if _, err := parse(t, text); err == nil {
+			t.Fatal("accepted invalid relay config", text)
+		}
+	}
+}

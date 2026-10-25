@@ -130,6 +130,10 @@ std::filesystem::path InstalledLayout(int argc)
     SetDefault("TTT2_SHADER_CACHE", root / "cache" / "shadercache");
     SetDefault("TTT2_VFS_ROOT", GameRoot() / "game_files_x");
     SetDefault("TTT2_SAVE_ROOT", root / "saves");
+    // Emulated external storage does not preserve POSIX ownership/mode bits.
+    // Keep account encryption keys and credentials in Android's private files dir.
+    if (const char* internal = SDL_GetAndroidInternalStoragePath(); internal && *internal)
+        SetDefault("TTT2_COMMUNITY_PRIVATE_DIR", std::filesystem::path(internal) / "community");
     SetDefault("XDG_CONFIG_HOME", root / "config");
     SetDefault("DXVK_STATE_CACHE_PATH", root / "cache");
     SetDefault("DXVK_PIPELINE_CACHE_FILE", root / "cache" / "dxvk-1.9.2b-ttt2-v1.vkcache");

@@ -2,8 +2,11 @@
 
 A community server for the Tekken Tag Tournament 2 PC port. Players add it in the game's server list (ONLINE
 MODE > SERVER); it is where they find each other - it lists their sessions and answers the game's own online
-services (news, profiles, rankings) - while the matches themselves run directly between the two players over
-Steam P2P, never through the server. Nobody runs a central server: every community hosts its own.
+services (news, profiles, rankings). Legacy clients play over Steam P2P. Cross-platform clients use standalone
+GameNetworkingSockets, directly between peers where possible and through a separately hosted coturn relay when
+needed. The community control service does not carry gameplay. Every community hosts its own service.
+
+Version **0.1.8-crossplay.1** adds optional cross-platform rooms.
 
 One program, no game data, nothing else to install (its database is built in). Windows and Linux (x86-64 and
 ARM64). Ship `THIRD_PARTY_NOTICES.txt` with it.
@@ -20,13 +23,13 @@ ARM64). Ship `THIRD_PARTY_NOTICES.txt` with it.
 
 ## Capacity
 
-One server handles thousands of players: `max_players` goes up to 10000. Matches cost the server nothing (they
-run over Steam P2P), so what grows with players is logins, session lists and the game's requests. Measured on a
+One server handles thousands of players: `max_players` goes up to 10000. The control service handles logins,
+session lists and the game's requests; cross-platform relay bandwidth is a separate coturn cost. Measured on a
 desktop PC: 10000 players logged in at about 4000 per second, about 20 KB of memory each, and all of them
 asking for the session list and the game's settings at the same moment were answered within 170 ms. The
 database takes about 12000 writes per second. A small VPS (1-2 cores, 1 GB of memory) is plenty for a
-few thousand players; bandwidth stays small (a ping every 5 s per player, plus lists and requests while players
-browse the menus).
+few thousand legacy players; bandwidth stays small (a ping every 5 s per player, plus lists and requests while
+players browse the menus). These measurements predate cross-platform signaling and are not relay capacity estimates.
 
 ## Admin commands
 
@@ -215,7 +218,7 @@ browsers to reach that name over HTTPS only (HSTS).
 
 ## Identifying players
 
-Players are identified by their Steam account. Choose one:
+Legacy clients are identified by their Steam account. Choose one:
 
 - **Checked (public servers).** Get a Steam Web API key at <https://steamcommunity.com/dev/apikey> and put it
   in `steam_web_api_key`. The server asks Steam to confirm every login. Keep the key secret: never share
@@ -270,14 +273,14 @@ can still sit in `server.db-wal` next to it). To restore, stop the server and pu
 
 ## Security
 
-- Game connections are encrypted (TLS 1.3, TLS 1.2 minimum). Matches never pass through the server: they go
-  directly between the two players over Steam P2P (Valve's relays), so the server never sees match traffic or
-  players' IP addresses beyond their own connection to it.
+- Control connections are encrypted (TLS 1.3, TLS 1.2 minimum). Legacy gameplay uses Steam P2P and Valve's
+  relays. Cross-platform gameplay uses encrypted GNS connections, directly or through the configured coturn
+  relay; the community service exchanges signaling, and the relay carries encrypted gameplay when needed.
 - Limits protect the server: connections per IP address or IPv6 /64 (`max_connections_per_ip`), handshake and
   idle timeouts, a one-minute block after five failed logins (password guessing), request rates per player, and
   size limits on everything.
-- Invites never move a player on their own: the game will show them in its own Accept / Decline window (until
-  that window is built, the game ignores them).
+- Steam invitations use Steam's join/accept flow; cross-platform joins authenticate with the advertised
+  community and request room admission. Non-Steam players can use room codes.
 - The public status reply (the server list's player count and ping) is answered at most 10 times a second per
   address and is never larger than 3x the request, so the server cannot be used to amplify attacks.
 - The admin commands answer only on the machine itself (loopback, with a token only the server's account can read).
@@ -340,3 +343,15 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o ttt2-server ./cmd/ttt2-serv
 Cross-compile with `GOOS=linux GOARCH=arm64` (or `amd64`, `windows`). `go test ./...` runs the tests
 (unit, attack, soak, database); `go test -race ./...` needs cgo. After changing dependencies, regenerate the
 notices with `python tools/notices.py > THIRD_PARTY_NOTICES.txt`. Protocol: [PROTOCOL.md](PROTOCOL.md).
+
+## Cross-platform rooms
+
+The optional protocol-3 mode supports server-issued accounts without Steam and
+standalone GameNetworkingSockets gameplay on Windows, Linux and Android.
+Enable `crossplay = true`; configure `stun_server`, `turn_server` and `turn_secret`
+for public hosting. Steam-only rooms continue to work independently.
+
+See [the cross-platform deployment](deploy/crossplay/README.md) for Compose,
+coturn, firewall ports, identity backups and bandwidth limits, and
+[client build and test instructions](../port/tools/crossplay/README.md) for room
+codes, optional Steam invitations and verified Recently Played With reporting.

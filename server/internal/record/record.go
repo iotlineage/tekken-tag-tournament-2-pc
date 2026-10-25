@@ -22,12 +22,13 @@ const (
 
 // Session is what the server keeps from a record.
 type Session struct {
-	ID       uint64
-	Host     uint64
-	HostXUID uint64 // the online XUID the host's game uses
-	Flags    uint32 // XSESSION_CREATE flags (Arbitrated: a ranked match)
-	Filled   uint32
-	Max      uint32
+	Crossplay bool
+	ID        uint64
+	Host      uint64
+	HostXUID  uint64 // the online XUID the host's game uses
+	Flags     uint32 // XSESSION_CREATE flags (Arbitrated: a ranked match)
+	Filled    uint32
+	Max       uint32
 	// OpenPublic: a public slot is free (what a search looks for); Contexts: the host's contexts (GAME_TYPE 0x800A:
 	// 0 ranked / 1 standard, GAME_MODE 0x800B, ...)
 	OpenPublic bool
@@ -50,7 +51,7 @@ func Check(rec []byte, sender uint64) (Session, error) {
 	maxPublic, maxPrivate, filledPublic, filledPrivate := r.U32(), r.U32(), r.U32(), r.U32()
 	info := r.Bytes(infoSize)
 	nCtx := r.U32()
-	if r.Err() != nil || magic != Magic || nCtx > MaxEntries {
+	if r.Err() != nil || (magic != Magic && magic != 0x33534553) || nCtx > MaxEntries {
 		return Session{}, errBad
 	}
 	contexts := make(map[uint32]uint32, nCtx)
@@ -73,6 +74,14 @@ func Check(rec []byte, sender uint64) (Session, error) {
 	if r.Err() != nil {
 		return Session{}, errBad
 	}
+	if magic == 0x33534553 {
+		r.U32() // netcode
+		address := r.Str()
+		code := r.Str()
+		if r.Err() != nil || len(r.B) != 0 || len(address) == 0 || len(address) > 512 || len(code) > 32 {
+			return Session{}, errBad
+		}
+	}
 	switch len(r.B) {
 	case 0, 4: // the optional netcode word
 	default:
@@ -87,9 +96,9 @@ func Check(rec []byte, sender uint64) (Session, error) {
 		return Session{}, errors.New("record: session info is for another session")
 	case binary.BigEndian.Uint64(info[infoHostOff:infoHostOff+8]) != sender:
 		return Session{}, errors.New("record: session info names another host")
-	case maxPublic > MaxSlots || maxPrivate > MaxSlots || filledPublic > maxPublic || filledPrivate > maxPrivate:
+	case maxPublic+maxPrivate > MaxSlots || maxPublic > MaxSlots || maxPrivate > MaxSlots || filledPublic > maxPublic || filledPrivate > maxPrivate:
 		return Session{}, errors.New("record: bad slot counts")
 	}
-	return Session{ID: id, Host: host, HostXUID: hostXUID, Flags: flags, Filled: filledPublic + filledPrivate, Max: maxPublic + maxPrivate,
+	return Session{Crossplay: magic == 0x33534553, ID: id, Host: host, HostXUID: hostXUID, Flags: flags, Filled: filledPublic + filledPrivate, Max: maxPublic + maxPrivate,
 		OpenPublic: filledPublic < maxPublic, Contexts: contexts}, nil
 }

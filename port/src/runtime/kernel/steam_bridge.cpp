@@ -42,9 +42,10 @@
 namespace steamnet {
 namespace {
 
-enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kTicket = 5, kCancelTicket = 6, kFriends = 7, kInvite = 8,
+enum : uint8_t { kSend = 1, kPublish = 2, kRemove = 3, kList = 4, kTicket = 5, kCancelTicket = 6, kFriends = 7, kInvite = 8, kPlayedWith = 9, kRequestJoin = 10,
                  kReady = 101, kRecv = 102, kListResult = 103, kJoin = 104, kTicketResult = 105, kFriendsResult = 106,
                  kInviteResult = 107 };
+std::atomic<uint64_t> g_startupLobby{0};
 constexpr uint32_t kMaxFrame = 16u << 20;
 
 void Put32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
@@ -397,6 +398,7 @@ bool LaunchHelper(const char* why)
         std::fprintf(stderr, "[steam] the new helper's Steam id %016llX is not the one before (%016llX)\n",
                      (unsigned long long)g_local.load(), (unsigned long long)before);
     g_running = true;
+    if (const auto lobby = g_startupLobby.exchange(0)) RequestJoinLobby(lobby);
     std::fprintf(stderr, "[steam] Steam runs in helper process %lu (Steam id %016llX), %s in %.1f s\n", GetProcessId(g_helper),
                  (unsigned long long)g_local.load(), why, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     // the lobbies this game hosts: the old helper's Steam lobbies went with it
@@ -437,7 +439,9 @@ bool Start(Receiver receiver)
     {
         g_inproc = true;
         std::fprintf(stderr, "[steam] TTT2_STEAM_INPROC=1: Steam in the game process (controllers will be hidden)\n");
-        return direct::Start(receiver);
+        const bool ok = direct::Start(receiver);
+        if (ok) if (const auto lobby = g_startupLobby.exchange(0)) direct::RequestJoinLobby(lobby);
+        return ok;
     }
     g_receiver = receiver;
     return LaunchHelper("started");
@@ -539,6 +543,22 @@ bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handl
     hex = std::move(it->second.second);
     g_tickets.erase(it);
     return handle != 0 && !hex.empty();
+}
+
+void RequestJoinLobby(uint64_t lobby)
+{
+    if (!lobby) return;
+    if (g_inproc && direct::Running()) { direct::RequestJoinLobby(lobby); return; }
+    if (!g_running) { g_startupLobby = lobby; return; }
+    uint8_t body[8]; Put64(body, lobby); g_out.Frame(kRequestJoin, body, 8);
+}
+
+void PlayedWith(uint64_t peer)
+{
+    if (!peer || peer == LocalId()) return;
+    if (g_inproc) { direct::PlayedWith(peer); return; }
+    uint8_t body[8]; Put64(body, peer);
+    if (g_running) g_out.Frame(kPlayedWith, body, 8);
 }
 
 void CancelTicket(uint32_t handle)
@@ -789,6 +809,10 @@ int RunBridge(int argc, char** argv)
                 g_out.Frame(kTicketResult, body.data(), body.size());
             }).detach();
         }
+        else if (type == kRequestJoin && p.size() == 8)
+            direct::RequestJoinLobby(Get64(p.data()));
+        else if (type == kPlayedWith && p.size() == 8)
+            direct::PlayedWith(Get64(p.data()));
         else if (type == kCancelTicket && p.size() >= 4)
             direct::CancelTicket(Get32(p.data()));
         else if (type == kFriends && p.size() >= 4)

@@ -1,0 +1,73 @@
+diff --git a/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_socketthread.cpp b/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_socketthread.cpp
+index 5a43c21..ac1430e 100644
+--- a/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_socketthread.cpp
++++ b/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_socketthread.cpp
+@@ -1,3 +1,8 @@
++#if defined(__ANDROID__)
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <arpa/inet.h>
++#endif
+ //========== Copyright (c) Valve Corporation. All Rights Reserved. ============
+ //
+ // Socket and service thread management for SteamNetworkingSockets.
+@@ -4225,14 +4230,56 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
+     free( pAddrInfo );
+ 	return true;
+ 
+-#elif IsPosix() && !IsPlaystation() && !IsAndroid() && !IsNintendoSwitch()
++#elif IsPosix() && !IsPlaystation() && !IsNintendoSwitch()
+ 
+ 	ifaddrs *pMyAddrInfo = NULL;
+ 	int r = getifaddrs( &pMyAddrInfo );
+ 	if ( r != 0 )
+ 	{
+-		SpewError( "getifaddrs failed, returning %d", r );
+-		return false;
++#if IsAndroid()
++        // Android can deny netlink interface enumeration to app UIDs. A UDP
++        // connect selects the default interface without transmitting a packet.
++        // ICE then discovers its public address using the configured STUN/TURN.
++        for ( int family : { AF_INET, AF_INET6 } )
++        {
++            int fd = socket( family, SOCK_DGRAM, IPPROTO_UDP );
++            if ( fd < 0 ) continue;
++            sockaddr_storage remote = {}, local = {};
++            socklen_t size = 0;
++            if ( family == AF_INET )
++            {
++                sockaddr_in *a = reinterpret_cast<sockaddr_in *>( &remote );
++                a->sin_family = AF_INET; a->sin_port = htons( 9 );
++                inet_pton( AF_INET, "192.0.2.1", &a->sin_addr );
++                size = sizeof( *a );
++            }
++            else
++            {
++                sockaddr_in6 *a = reinterpret_cast<sockaddr_in6 *>( &remote );
++                a->sin6_family = AF_INET6; a->sin6_port = htons( 9 );
++                inet_pton( AF_INET6, "2001:db8::1", &a->sin6_addr );
++                size = sizeof( *a );
++            }
++            socklen_t localSize = sizeof( local );
++            if ( connect( fd, reinterpret_cast<sockaddr *>( &remote ), size ) == 0 &&
++                 getsockname( fd, reinterpret_cast<sockaddr *>( &local ), &localSize ) == 0 )
++            {
++                SteamNetworkingIPAddr ip;
++                if ( family == AF_INET ) ip.SetIPv4( BigDWord( reinterpret_cast<sockaddr_in *>( &local )->sin_addr.s_addr ), 0 );
++                else ip.SetIPv6( reinterpret_cast<sockaddr_in6 *>( &local )->sin6_addr.s6_addr, 0 );
++                if ( !GetLocalAddresses_IsReserved( ip ) )
++                {
++                    LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
++                    entry.m_addr = ip; entry.m_nPrefixLen = 0;
++                }
++            }
++            close( fd );
++        }
++        return pAddrs->Count() != 0;
++#else
++        SpewError( "getifaddrs failed, returning %d", r );
++        return false;
++#endif
+ 	}
+ 	for ( ifaddrs *pAddr = pMyAddrInfo ; pAddr ; pAddr = pAddr->ifa_next )
+ 	{

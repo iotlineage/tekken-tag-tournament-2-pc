@@ -17,18 +17,20 @@ var Regions = []string{"world", "north-america", "south-america", "europe", "mid
 
 // Config is the server's configuration.
 type Config struct {
-	Name              string
-	Region            string
-	MOTD              string
-	News              []string // the game's online news: at most 10 lines of 119 characters
-	MaxPlayers        int
-	Password          string
-	Port              int
-	BindAddress       string
-	DataDir           string
-	AcceptedProtocols []string
-	SteamWebAPIKey    string
-	SteamAppID        int
+	Crossplay                          bool
+	STUNServer, TURNServer, TURNSecret string
+	Name                               string
+	Region                             string
+	MOTD                               string
+	News                               []string // the game's online news: at most 10 lines of 119 characters
+	MaxPlayers                         int
+	Password                           string
+	Port                               int
+	BindAddress                        string
+	DataDir                            string
+	AcceptedProtocols                  []string
+	SteamWebAPIKey                     string
+	SteamAppID                         int
 	// Trust the Steam IDs games claim when there is no Web API key (LAN / friends only); must be set explicitly.
 	TrustUnverified bool
 	MaxConnsPerIP   int
@@ -84,7 +86,7 @@ max_players = 64
 password = ""
 
 # TCP (the games' connections) and UDP (the server list's player count and ping) port. Open both in the firewall /
-# router. Matches do not go through the server: players connect to each other over Steam.
+# router. Gameplay uses Steam or direct/relayed GNS; the control service only coordinates rooms.
 port = 28200
 # Listen on one address only (e.g. "127.0.0.1" for tests); empty = every address.
 bind_address = ""
@@ -94,11 +96,18 @@ data_dir = "data"
 # Game versions this server accepts (the port's online protocol strings).
 accepted_protocols = ["ttt2-port-10-rollback"]
 
+# Cross-platform clients use server-issued credentials. Legacy Steam login still requires
+# steam_web_api_key or trust_unverified_steam_ids. TURN uses coturn shared-secret authentication.
+crossplay = false
+stun_server = ""
+turn_server = ""
+turn_secret = ""
+
 # Players are identified by their Steam ID, checked with Steam at every login. That needs a Steam Web API key:
 # https://steamcommunity.com/dev/apikey (keep it secret; this file should be readable by the server only).
 steam_web_api_key = ""
 steam_app_id = 480
-# Without a key the server does not start - unless you set this to true: then it trusts the Steam ID each
+# Legacy Steam login without a key requires this setting (crossplay accounts do not): then it trusts the Steam ID each
 # game claims (anyone could pretend to be someone else). Only for a LAN or a group of friends; the game's
 # server list marks such a server as unverified.
 trust_unverified_steam_ids = false
@@ -174,6 +183,14 @@ func Parse(s *bufio.Scanner, name string) (Config, error) {
 		}
 		var err error
 		switch key {
+		case "crossplay":
+			c.Crossplay, err = parseBool(value)
+		case "stun_server":
+			c.STUNServer, err = parseString(value)
+		case "turn_server":
+			c.TURNServer, err = parseString(value)
+		case "turn_secret":
+			c.TURNSecret, err = parseString(value)
 		case "name":
 			c.Name, err = parseString(value)
 		case "region":
@@ -240,6 +257,12 @@ func (c Config) Check() error {
 		ok = ok || r == c.Region
 	}
 	switch {
+	case (c.TURNServer == "") != (c.TURNSecret == ""):
+		return fmt.Errorf("turn_server and turn_secret must be configured together")
+	case len(c.TURNSecret) > 512 || strings.ContainsAny(c.TURNSecret, "\r\n"):
+		return fmt.Errorf("turn_secret: at most 512 characters without newlines")
+	case !iceAddress(c.STUNServer) || !iceAddress(c.TURNServer):
+		return fmt.Errorf("stun_server and turn_server: one hostname:port or [IPv6]:port each")
 	case !ok:
 		return fmt.Errorf("region %q: use one of %s", c.Region, strings.Join(Regions, ", "))
 	case c.Name == "" || len(c.Name) > 64 || !printable(c.Name, false):
@@ -277,6 +300,19 @@ func (c Config) Check() error {
 	}
 	_, err := ParseAllow(c.AdminPanelAllow)
 	return err
+}
+
+// One endpoint per service; GNS expects matching TURN server/user/password lists.
+func iceAddress(address string) bool {
+	if address == "" {
+		return true
+	}
+	if len(address) > 255 || strings.ContainsAny(address, " ,/?#\r\n\t") {
+		return false
+	}
+	host, port, err := net.SplitHostPort(address)
+	n, numberErr := strconv.Atoi(port)
+	return err == nil && numberErr == nil && host != "" && n > 0 && n <= 65535
 }
 
 // ParseAllow reads admin_panel_allow: IP addresses ("203.0.113.7", "2001:db8::7") and CIDR ranges
@@ -372,7 +408,7 @@ func parseBool(v string) (bool, error) {
 
 // CheckIdentity is the start-up rule for Steam IDs: a Web API key, or an explicit choice to trust them.
 func (c Config) CheckIdentity() error {
-	if c.SteamWebAPIKey == "" && !c.TrustUnverified {
+	if c.SteamWebAPIKey == "" && !c.TrustUnverified && !c.Crossplay {
 		return fmt.Errorf("set steam_web_api_key (https://steamcommunity.com/dev/apikey) to check players' Steam IDs, " +
 			"or set trust_unverified_steam_ids = true for a LAN / friends server")
 	}

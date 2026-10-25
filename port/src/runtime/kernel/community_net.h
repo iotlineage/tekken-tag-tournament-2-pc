@@ -18,6 +18,10 @@ namespace community {
 
 struct Options
 {
+    bool crossplay = false;
+    // Called only after pinning TLS. Store credentials by full server-key fingerprint.
+    std::function<std::string(const std::string&)> loadCredential;
+    std::function<bool(const std::string&, const std::string&)> saveCredential;
     std::string host;
     uint16_t port = 28200;
     uint64_t steamId = 0;                     // the player's Steam ID (or a test id on a trusting server)
@@ -40,6 +44,9 @@ enum Refusal : int
 
 struct Welcome
 {
+    bool crossplay = false;
+    uint64_t steamId = 0;
+    std::string stunServer, turnServer, turnUser, turnPassword;
     uint64_t peer = 0;
     bool verified = false;                    // the server checked the Steam ID with Steam
     bool gin = false;                         // the server answers the game's GIN requests (GinRequest)
@@ -121,6 +128,16 @@ public:
     void PutFile(uint64_t ownXuid, const std::string& item, const std::vector<uint8_t>& data);
     int GetFile(uint64_t ownerXuid, const std::string& item, std::vector<uint8_t>& data, int timeoutMs);
     bool KeepsFiles() const;
+    bool Crossplay() const;
+    bool JoinRoom(uint64_t room, int timeoutMs = 4000, const std::string& code = "");
+    std::string RoomCode(uint64_t room) const;
+    void LeaveRoom(uint64_t room);
+    // Authoritative membership and verified Steam bindings from the TLS server.
+    std::map<uint64_t, uint64_t> RoomPeers() const;
+    std::map<uint64_t, uint64_t> ConnectionPeers() const; // includes short-lived discovery, with no Steam identity
+    bool SendSignal(uint64_t peer, const void* data, size_t size);
+    bool TakeSignal(uint64_t& peer, std::vector<uint8_t>& data);
+    bool TakeRelayCredentials(std::string& user, std::string& password);
 
     // Is `peer` (a Steam ID that reached this game directly) a player of this server? 1 yes, 0 no, -1 no answer
     // (asked too often, or the connection ended): games on a server play only with each other.
@@ -151,6 +168,7 @@ bool ParseAddress(const std::string& text, std::string& host, uint16_t& port);
 // message of the day) and its answer, bounded and cleaned like everything else a server sends.
 struct ServerInfo
 {
+    bool crossplay = false;
     uint16_t protocolVersion = 0;
     bool password = false;                    // the server asks for a password
     bool verified = false;                    // the server checks Steam IDs with Steam

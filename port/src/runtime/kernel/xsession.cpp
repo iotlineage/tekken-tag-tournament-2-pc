@@ -12,6 +12,7 @@
 #include "live_stats.h"
 #include "community_net.h"
 #include "net_transport.h"
+#include "steam_net.h"
 #include <chrono>
 #include <memory>
 #include <random>
@@ -110,11 +111,16 @@ void Publish(const Session& s)
 // 0xB0010 XSessionCreate {obj, flags, maxPublic, maxPrivate, user, pSessionInfo, pNonce}
 uint32_t Create(uint8_t* base, uint32_t b)
 {
+    auto lifecycle = net::LockSessionNetwork();
     std::lock_guard l(g_mutex);
     Session* s = Lookup(base, GRead32(base, b));
     if (!s || s->created) return ERROR_FUNCTION_FAILED_;
     const uint32_t flags = GRead32(base, b + 4), info = GRead32(base, b + 0x14), nonceOut = GRead32(base, b + 0x18);
     if (!profiles::SignedIn() || !info) return ERROR_FUNCTION_FAILED_;
+    if ((flags & (kMatchmaking | kPeerNetwork)) && net::Crossplay()) {
+        const auto server = net::Community();
+        if (!server || !server->Connected()) return X_ONLINE_E_SESSION_NOT_FOUND;
+    }
     s->created = true;
     s->flags = flags;
     s->maxPublic = GRead32(base, b + 8);
@@ -134,6 +140,19 @@ uint32_t Create(uint8_t* base, uint32_t b)
     {
         s->id = Read64(base, info);                                // joining: the search result's id
         if (nonceOut) s->nonce = Read64(base, nonceOut);
+    }
+    if (!(flags & kHost) && (flags & (kMatchmaking | kPeerNetwork)) && net::Crossplay()) {
+        const auto server = net::Community();
+        mm::SessionRecord record;
+        if (!mm::Find(s->id, record)) { s->created = false; return X_ONLINE_E_SESSION_NOT_FOUND; }
+        const std::string code = record.roomCode;
+        if (server && server->Crossplay() && !server->JoinRoom(s->id, 4000, code)) {
+            s->created = false; return X_ONLINE_E_SESSION_NOT_FOUND;
+        }
+        if (server && server->Crossplay()) {
+            record.roomCode = server->RoomCode(s->id);
+            mm::AdvertiseInvite(record);
+        }
     }
     s->info.assign(base + info, base + info + 0x3C);
     Log("create" + std::to_string(flags), "XSessionCreate(flags %03X, public %u, private %u) -> %016llX", flags,
@@ -394,7 +413,7 @@ bool XSessionAnyActive()
 {
     std::lock_guard l(g_mutex);
     for (const auto& [handle, s] : g_sessions)
-        if (s.created && s.state != State::Deleted) return true;
+        if (s.created && s.state != State::Deleted && (s.flags & (kMatchmaking | kPeerNetwork))) return true;
     return false;
 }
 
@@ -413,6 +432,10 @@ uint64_t XSessionCurrentId()
 void XSessionReportMatch(bool started)
 {
     const std::shared_ptr<community::Client> server = net::Community();
+    if (started) {
+        const uint64_t steamPeer = net::SteamPeer(XSocketMatchPeer());
+        if (steamPeer && steamPeer != steamnet::LocalId()) steamnet::PlayedWith(steamPeer);
+    }
     if (!server || !server->Connected()) return;
     uint64_t id = 0;
     uint8_t local = 0;
@@ -517,6 +540,7 @@ uint32_t XgiDispatch(uint8_t* base, uint32_t msg, uint32_t b, uint32_t length, b
         if (!s) return STATUS_INVALID_HANDLE_;
         s->state = State::Deleted;
         mm::Remove(s->id);
+        if (const auto server = net::Community(); server && server->Crossplay()) server->LeaveRoom(s->id);
         XSocketForgetMatchPeer();                            // the next match names its own opponent
         Log("delete", "XSessionDelete(%016llX)", (unsigned long long)s->id);
         return S_OK_;

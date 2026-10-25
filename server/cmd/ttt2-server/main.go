@@ -37,7 +37,7 @@ import (
 	"ttt2-server/internal/tlsid"
 )
 
-var version = "dev"
+var version = "0.1.8-crossplay.1"
 
 func main() {
 	configPath := flag.String("config", "server.toml", "configuration file (created with defaults when missing)")
@@ -144,7 +144,11 @@ func main() {
 	}
 	check := "Steam IDs are checked with Steam"
 	if verifier == nil {
-		check = "WARNING: Steam IDs are NOT checked (trust_unverified_steam_ids = true): LAN / friends use only"
+		if cfg.TrustUnverified {
+			check = "WARNING: Steam IDs are NOT checked (trust_unverified_steam_ids = true): LAN / friends use only"
+		} else {
+			check = "Community credentials enabled; legacy Steam login disabled"
+		}
 	}
 	logger.Printf("ttt2-server %s: %q (%s), port %d TCP+UDP, up to %d players, accepts %s",
 		version, cfg.Name, cfg.Region, cfg.Port, cfg.MaxPlayers, strings.Join(cfg.AcceptedProtocols, ", "))
@@ -206,8 +210,11 @@ func reload(h *hub.Hub, db *store.Store, pnl *panel.Panel, configPath string, no
 		return
 	}
 	old := h.Config()
-	if cfg.Port != old.Port || cfg.SteamWebAPIKey != old.SteamWebAPIKey || cfg.TrustUnverified != old.TrustUnverified {
-		note("port and Steam settings change only with a restart")
+	if cfg.Port != old.Port || cfg.BindAddress != old.BindAddress || cfg.SteamWebAPIKey != old.SteamWebAPIKey || cfg.TrustUnverified != old.TrustUnverified || cfg.SteamAppID != old.SteamAppID || cfg.Crossplay != old.Crossplay || cfg.STUNServer != old.STUNServer || cfg.TURNServer != old.TURNServer || cfg.TURNSecret != old.TURNSecret {
+		note("port, identity, crossplay and relay settings change only with a restart")
+		cfg.Port, cfg.BindAddress = old.Port, old.BindAddress
+		cfg.SteamWebAPIKey, cfg.SteamAppID, cfg.TrustUnverified = old.SteamWebAPIKey, old.SteamAppID, old.TrustUnverified
+		cfg.Crossplay, cfg.STUNServer, cfg.TURNServer, cfg.TURNSecret = old.Crossplay, old.STUNServer, old.TURNServer, old.TURNSecret
 	}
 	h.SetConfig(cfg)
 	db.SetUploadQuota(int64(cfg.MaxUploadStorageMB) << 20)

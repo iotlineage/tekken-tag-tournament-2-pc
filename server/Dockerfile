@@ -9,7 +9,7 @@
 # set admin_panel = true in server.toml, and publish its port as well: -p 28201:28201/tcp
 # The program runs as a non-root user: the mounted folder must be writable by uid 65532.
 FROM golang:1.27 AS build
-ARG VERSION=dev
+ARG VERSION=0.1.8-crossplay.1
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify

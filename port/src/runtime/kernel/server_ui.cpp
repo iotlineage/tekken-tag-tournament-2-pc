@@ -13,9 +13,12 @@
 //
 // Tests: TTT2_SERVER=<address> (TTT2_SERVER_PASSWORD) starts with that server as the network, unsaved.
 #include "server_ui.h"
+#include "xlive.h"
 #include "community_net.h"
 #include "menu_host.h"
 #include "net_transport.h"
+#include "matchmaking.h"
+#include <optional>
 #include "server_list.h"
 #include "sys_ui.h"
 #include "steam_net.h"
@@ -26,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <SDL3/SDL.h>
 #include <ctime>
 #include <deque>
 #include <functional>
@@ -39,6 +43,8 @@
 #include <vector>
 
 uint64_t XSessionCurrentId();   // xsession.cpp: the room session this game is in (0: none)
+
+bool XSessionAnyActive();
 
 namespace server_ui {
 namespace {
@@ -220,7 +226,7 @@ void Enqueue(const std::shared_ptr<Job>& job)
 // ---- state (main thread only)
 struct Entry
 {
-    enum class Kind { Steam, Saved, Lan, Add } kind = Kind::Steam;
+    enum class Kind { Steam, Saved, Lan, Add, JoinCode } kind = Kind::Steam;
     std::string address, name, password;
     server_list::Live live;
 };
@@ -405,6 +411,7 @@ void Settle()
 void Disconnect()
 {
     if (g.address.empty()) return;
+    if (XSessionAnyActive()) { Info("Leave the current room before changing networks."); return; }
     std::fprintf(stderr, "[srv-ui] leaving %s\n", g.address.c_str());
     g.address.clear();
     g.name.clear();
@@ -513,7 +520,7 @@ void Finished(const std::shared_ptr<Job>& job)
             std::fprintf(stderr, "[srv-ui] %s refused this player (banned or kicked)\n", address.c_str());
         }
         std::string text = "Could not connect to " + g.jobName + ".\n\n" + Wrap(Sentence(GameText(job->error, 300)), 44, 5);
-        if (!g.jobFromList) text += "\n\nYou are playing on Steam.";
+        if (!g.jobFromList) text += "\n\nChoose SERVER to select a network.";
         Info(text);
         return;
     }
@@ -541,6 +548,7 @@ void Finished(const std::shared_ptr<Job>& job)
 // the outcome.
 void EnterOnline()
 {
+    if (net::Community() && net::Community()->Connected()) { Settle(); return; }
     const char* test = std::getenv("TTT2_SERVER");
     const std::string target = test ? std::string(test) : server_list::Current();
     if (target.empty() || server_list::SameAddress(target, g.address))
@@ -588,7 +596,8 @@ std::string InfoText(const std::string& address, const server_list::Live& live)
     std::string notes;
     if (!Compatible(i)) notes += "Another version of the game. ";
     if (i.password) notes += "Asks for a password. ";
-    if (!i.verified) notes += "Does not check Steam accounts. ";
+    if (i.crossplay) notes += "Cross-platform rooms. ";
+    else if (!i.verified) notes += "Does not check Steam accounts. ";
     if (!notes.empty()) text += "\n" + GameText(notes, 120);
     const std::string motd = Motd(i.motd);
     if (!motd.empty()) text += "\n\n" + motd;
@@ -612,6 +621,62 @@ void ServerInfo(const Entry& e)
         b.done = [address, name, live](int choice) { if (choice == 0) ConnectChecked(address, name, live, true); };
         Show(std::move(b));
     });
+}
+
+std::optional<mm::SessionRecord> pendingInvite;
+
+bool ParseRoomCode(const std::string& text, mm::SessionRecord& record)
+{
+    const auto split = text.find('#');
+    if (split == std::string::npos || text.size() != split + 50 || text[split+17] != '#') return false;
+    std::string host; uint16_t port;
+    if (!community::ParseAddress(text.substr(0, split), host, port)) return false;
+    uint64_t room = 0;
+    for (size_t i = split+1; i < text.size(); ++i) {
+        if (i == split+17) continue;
+        const char c = text[i];
+        const int digit = c >= '0' && c <= '9' ? c-'0' : c >= 'a' && c <= 'f' ? c-'a'+10 : c >= 'A' && c <= 'F' ? c-'A'+10 : -1;
+        if (digit < 0) return false;
+        if (i < split+17) room = room*16 + uint64_t(digit);
+    }
+    if (!room) return false;
+    record = {}; record.crossplay = true; record.id = room;
+    record.serverAddress = text.substr(0, split); record.roomCode = text.substr(split+18);
+    return true;
+}
+
+void JoinRoomCode()
+{
+    if (XSessionAnyActive()) { Info("Leave the current room before joining another."); return; }
+    SysUiTextBox t;
+    t.prompt = "Paste the room code shared by your friend.";
+    t.hint = "ENTER: join   ESC: cancel   CTRL+V: paste";
+    t.allowed = ".:-[]#"; t.maxLength = 562;
+    t.check = [](const std::string& text) {
+        mm::SessionRecord r;
+        return ParseRoomCode(text, r) ? std::string() : std::string("Use the complete code, including the server address.");
+    };
+    t.done = [](bool ok, const std::string& text) {
+        mm::SessionRecord r;
+        if (!ok || !ParseRoomCode(text, r)) return;
+        pendingInvite = r;
+        if (!net::Crossplay() || !server_list::SameAddress(g.address, r.serverAddress))
+            ConnectChecked(r.serverAddress, "Cross-platform room", server_list::Get(r.serverAddress), true);
+    };
+    Show(std::move(t));
+}
+
+void ShareRoomCode()
+{
+    const auto server = net::Community();
+    const auto room = XSessionCurrentId();
+    const auto capability = server ? server->RoomCode(room) : std::string();
+    if (!room || capability.empty()) { Info("The room is not available yet. Try again in a moment."); return; }
+    char id[17]; std::snprintf(id, sizeof(id), "%016llx", (unsigned long long)room);
+    const auto code = net::ServerAddress() + "#" + id + "#" + capability;
+    if (SDL_SetClipboardText(code.c_str()))
+        Info("Room code copied. Send it to your friend.\nThey can use ONLINE MODE > SERVER > JOIN ROOM CODE.");
+    else Info("Room code:\n" + code);
 }
 
 void AddServer()
@@ -689,6 +754,7 @@ void BuildEntries()
     for (const server_list::Found& f : server_list::Lan())
         if (!BannedFrom(f.address)) list.push_back({ Entry::Kind::Lan, f.address, f.live.info.name, "", f.live });
     list.push_back({ Entry::Kind::Add });
+    list.push_back({ Entry::Kind::JoinCode });
     g.entries = std::move(list);
     g.top = std::clamp(g.top, 0, (std::max)(0, int(g.entries.size()) - kRows));
 }
@@ -704,7 +770,11 @@ RowText TextOf(const Entry& e)
     case Entry::Kind::Steam:
         r.label = "STEAM";
         r.value = current ? "PLAYING HERE" : "FRIENDS & INVITES";
-        r.help = "Play with your Steam friends. No server needed.";
+        r.help = "Steam-only sessions. No community server needed.";
+        return r;
+    case Entry::Kind::JoinCode:
+        r.label = "JOIN ROOM CODE";
+        r.help = "Join a cross-platform room using a shared code.";
         return r;
     case Entry::Kind::Add:
         r.label = "ADD SERVER";
@@ -831,6 +901,9 @@ void ListFrame(PPCContext& ctx, uint8_t* base, bool windowFree)
                 case Entry::Kind::Steam:
                     if (!g.address.empty()) { Disconnect(); server_list::SetCurrent(""); }
                     break;
+                case Entry::Kind::JoinCode:
+                    JoinRoomCode();
+                    break;
                 case Entry::Kind::Add:
                     AddServer();
                     break;
@@ -840,7 +913,7 @@ void ListFrame(PPCContext& ctx, uint8_t* base, bool windowFree)
                     break;
                 }
             }
-            else if ((pressed & kY) && entry.kind != Entry::Kind::Add)
+            else if ((pressed & kY) && entry.kind != Entry::Kind::Add && entry.kind != Entry::Kind::JoinCode)
             {
                 menu_host::PlaySound(ctx, base, menu_host::SoundDecide);
                 if (entry.kind == Entry::Kind::Steam)
@@ -935,11 +1008,11 @@ bool Enabled()
     return on;
 }
 
-void FriendInvite()
+void SteamFriendInvite()
 {
     std::fprintf(stderr, "[srv-ui] Friend Invite\n");
     if (g_friendList || g_invite) return;                       // one at a time
-    if (!g.address.empty())
+    if (!g.address.empty() && !net::Crossplay())
     {
         // a community server's rooms take only its players: a Steam invite would bring a friend who is not on it
         Info("Friend invites work on Steam (ONLINE MODE > SERVER > STEAM).\nOn " + g.name +
@@ -968,6 +1041,16 @@ void FriendInvite()
         t->friends = std::move(friends);
         t->done = true;
     }).detach();
+}
+
+void FriendInvite()
+{
+    if (!net::Crossplay()) { SteamFriendInvite(); return; }
+    SysUiMessageBox b;
+    b.text = "Invite someone to this cross-platform room.";
+    b.buttons = { "COPY ROOM CODE", "STEAM FRIEND", "CANCEL" }; b.cancel = 2;
+    b.done = [](int choice) { if (choice == 0) ShareRoomCode(); else if (choice == 1) SteamFriendInvite(); };
+    Show(std::move(b));
 }
 
 namespace {
@@ -1014,9 +1097,63 @@ std::string StatusLine()
     return g_status;
 }
 
+namespace {
+struct InviteLookup {
+    std::mutex mutex;
+    bool done = false, ok = false;
+    mm::SessionRecord record;
+};
+std::shared_ptr<InviteLookup> inviteLookup;
+void PumpSteamInvite()
+{
+    if (inviteLookup) {
+        std::unique_lock lock(inviteLookup->mutex);
+        if (!inviteLookup->done) return;
+        auto result = std::move(inviteLookup); lock.unlock();
+        if (result->ok && !XSessionAnyActive() && net::Crossplay() &&
+            server_list::SameAddress(net::ServerAddress(), result->record.serverAddress)) mm::QueueInvite(result->record);
+        else Info("This room is no longer available. Ask your friend for a new invitation.");
+    }
+    mm::SessionRecord r;
+    if (!pendingInvite && mm::TakeSteamInvite(r)) {
+        if (XSessionAnyActive()) {
+            Info("Leave your current room, then accept the Steam invitation again.");
+        } else if (!r.crossplay) {
+            pendingInvite = r;
+            server_list::SetCurrent("");
+            if (net::Community()) Disconnect();
+        } else {
+            pendingInvite = r;
+            if (!net::Crossplay() || !server_list::SameAddress(g.address, r.serverAddress))
+                ConnectChecked(r.serverAddress, "Cross-platform room", server_list::Get(r.serverAddress), true);
+        }
+    }
+    if (!pendingInvite || g.job || SysUiBoxBusy() || !g.boxes.empty()) return;
+    const auto server = net::Community();
+    if (!pendingInvite->crossplay) {
+        if (!server) { mm::QueueInvite(*pendingInvite); pendingInvite.reset(); }
+        return;
+    }
+    if (server && server->Connected() && server->Crossplay() && server_list::SameAddress(g.address, pendingInvite->serverAddress)) {
+        const auto invited = *pendingInvite; pendingInvite.reset();
+        auto lookup = std::make_shared<InviteLookup>(); inviteLookup = lookup;
+        std::thread([lookup, invited] {
+            mm::SessionRecord current;
+            const bool ok = mm::Find(invited.id, current) && (!invited.hostPeer || current.hostPeer == invited.hostPeer);
+            current.roomCode = invited.roomCode;
+            std::lock_guard lock(lookup->mutex);
+            lookup->record = std::move(current); lookup->ok = ok; lookup->done = true;
+        }).detach();
+    } else pendingInvite.reset();
+}
+}
+
 void Frame(PPCContext& ctx, uint8_t* base)
 {
     if (!Enabled()) return;
+    xlive::RefreshTitleXnAddr(base);
+    if (const auto server = net::Community(); server && !server->Connected()) mm::HideSocialRooms();
+    PumpSteamInvite();
     const std::string reported = menu_host::CurrentFrame(ctx, base);
     if (reported != g.candidate) { g.candidate = reported; g.candidateFrames = 0; }
     else if (g.candidateFrames < kStableFrames) ++g.candidateFrames;
@@ -1066,7 +1203,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
     }
     // a lost connection: back to Steam, and the player is told once in the menus
     if (!g.address.empty())
-        if (const std::shared_ptr<community::Client> server = net::Community(); server && !server->Connected())
+        if (const std::shared_ptr<community::Client> server = net::Community(); server && !server->Connected() && !XSessionAnyActive())
         {
             if (server->Refusal() == community::RefusedBanned)
             {
@@ -1078,11 +1215,11 @@ void Frame(PPCContext& ctx, uint8_t* base)
                 server->BanUntil(until);
                 NoteBan(g.address, until);
                 std::fprintf(stderr, "[srv-ui] %s removed this player (kicked or banned)\n", g.address.c_str());
-                g.lostNote = g.name + "\n\n" + Wrap(Sentence(GameText(why, 200)), 44, 4) + "\n\nYou are playing on Steam.";
+                g.lostNote = g.name + "\n\n" + Wrap(Sentence(GameText(why, 200)), 44, 4) + "\n\nChoose SERVER to select a network.";
             }
             else
                 g.lostNote = "The connection to " + g.name + " was lost.\n" + Wrap(Sentence(GameText(server->CloseReason(), 120)), 44, 3) +
-                             "\n\nYou are playing on Steam. Choose SERVER to connect again.";
+                             "\n\nChoose SERVER to connect again.";
             Disconnect();
         }
     const bool menus = frame == kOnlineMenu || frame == kListFrame;
@@ -1224,7 +1361,7 @@ void KeyHints(PPCContext& ctx, uint8_t* base)
     if (!g.listUp || !g.drawn) return;
     const Entry* e = Focused(ctx, base);
     if (!e) return;
-    if (e->kind != Entry::Kind::Add) menu_host::KeyHint(ctx, base, kHintY, "SERVER INFO");
+    if (e->kind != Entry::Kind::Add && e->kind != Entry::Kind::JoinCode) menu_host::KeyHint(ctx, base, kHintY, "SERVER INFO");
     if (e->kind == Entry::Kind::Saved) menu_host::KeyHint(ctx, base, kHintX, "REMOVE");
 }
 

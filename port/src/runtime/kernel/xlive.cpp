@@ -24,6 +24,7 @@
 #include "community_net.h"
 #include "matchmaking.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <thread>
 #include <atomic>
@@ -79,6 +80,13 @@ struct PeerTable
     std::map<uint32_t, uint64_t> peerOf;
     uint32_t next = 1;
 } g_peers;
+
+// The title obtains its own XNADDR before ONLINE MODE, then uses that cached
+// result in the NACE fight handshake. These two verified call sites write a
+// persistent result (82B3B9F4: manager +340 result +8) or global (82B545BC).
+// Do not retain the stack result used by the unrelated 828CADE4 caller.
+std::mutex g_titleAddrMutex;
+std::map<uint32_t, std::array<uint8_t, 0x24>> g_titleAddrs;
 
 constexpr uint32_t kVirtualNet = 0x0A4E0000u;  // 10.78.x.y: never routed, our sockets resolve it
 uint32_t OwnAddr(uint64_t peer) { return 0x0A4D0000u | uint32_t(peer & 0xFFFF); }   // 10.77.x.y
@@ -154,7 +162,10 @@ uint64_t OnlineXuid(uint32_t user)
     // Online XUIDs are 0x0009xxxxxxxxxxxx: here unique per machine (the peer id), profile and local user
     // (users 1-3 are the profile's guests, kernel_xam.cpp).
     if (!profiles::SignedIn()) return 0;
-    const uint64_t mix = LocalPeerId() * 0x9E3779B97F4A7C15ull ^ profiles::ActiveXuid() ^ uint64_t(user) * 0xD6E8FEB86659FD93ull;
+    // A community login changes the routing peer, but must not change the XUID
+    // already cached by the title (GIN login, licence paths and save ownership).
+    XSocketStartTransport();
+    const uint64_t mix = net::ProfilePeer() * 0x9E3779B97F4A7C15ull ^ profiles::ActiveXuid() ^ uint64_t(user) * 0xD6E8FEB86659FD93ull;
     return 0x0009000000000000ull | (mix & 0x0000FFFFFFFFFFFFull);
 }
 
@@ -169,6 +180,27 @@ void WriteOwnXnAddr(uint8_t* base, uint32_t a)
     for (int i = 0; i < 6; ++i) GWrite8(base, a + 0x0A + i, uint8_t(peer >> (8 * i)) | (i == 0 ? 0x02 : 0));
     Write64(base, a + 0x18, peer);                                     // abOnline: our peer id
     GWrite8(base, a + 0x20, 1);                                        // platform: Xbox 360
+}
+
+void RefreshTitleXnAddr(uint8_t* base)
+{
+    const uint64_t peer = net::LocalPeer();
+    if (!peer) return;
+    std::lock_guard lock(g_titleAddrMutex);
+    for (auto it = g_titleAddrs.begin(); it != g_titleAddrs.end();) {
+        const auto addr = it->first;
+        // A freed/reused result is never rewritten. The original 36 bytes must
+        // still match, not just an address-shaped field in unrelated memory.
+        if (std::memcmp(base + addr, it->second.data(), it->second.size())) {
+            it = g_titleAddrs.erase(it); continue;
+        }
+        if (Read64(base, addr + 0x18) != peer) {
+            WriteOwnXnAddr(base, addr);
+            std::memcpy(it->second.data(), base + addr, it->second.size());
+            std::fprintf(stderr, "[xlive] refreshed cached title XNADDR %08X to peer %016llX\n", addr, (unsigned long long)peer);
+        }
+        ++it;
+    }
 }
 
 uint32_t GuestAlloc(uint32_t bytes)
@@ -215,7 +247,14 @@ PPC_FUNC(__imp__NetDll_XNetGetTitleXnAddr)
         ctx.r3.u64 = 1;                                    // XNET_GET_XNADDR_NONE
         return;
     }
-    if (addr) xlive::WriteOwnXnAddr(base, addr);
+    if (addr) {
+        xlive::WriteOwnXnAddr(base, addr);
+        if (uint32_t(ctx.lr) == 0x82B3B9F4u || uint32_t(ctx.lr) == 0x82B545BCu) {
+            std::lock_guard lock(g_titleAddrMutex);
+            if (g_titleAddrs.count(addr) || g_titleAddrs.size() < 8)
+                std::memcpy(g_titleAddrs[addr].data(), base + addr, 0x24);
+        }
+    }
     Trace("xnaddr", "XNetGetTitleXnAddr -> 0xE6 (peer %016llX)", (unsigned long long)xlive::LocalPeerId());
     ctx.r3.u64 = 0xE6;                                     // ETHERNET|STATIC|GATEWAY|DNS|ONLINE
 }

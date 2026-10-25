@@ -273,3 +273,75 @@ One server is meant for thousands of players at once. Measured (`go test ./inter
 20 KB of memory each); all 10000 then list sessions and ask GIN at the same moment and every answer arrives
 within 170 ms. Session lists are built at most every 250 ms and shared by everyone who asks within that window.
 The database (`internal/store`, SQLite in WAL mode) takes about 12000 player writes per second.
+
+## Cross-platform extension (control protocol 3)
+
+Version 2 remains the legacy Steam protocol. Version 3 is accepted only when
+`crossplay = true`. Both use the same framing, pinned TLS key, game-version
+check, password, ban checks, quotas and ordinary game-service frames.
+Anonymous INFO retains version 2 for compatibility; flags bit 2 advertises
+cross-platform support. The mode is fixed for an authenticated connection.
+
+V3 AUTH is `u64(0), str(profile), blob(account credential), str(password),
+u64(optional Steam ID), blob(optional Steam Web API ticket)`. An empty account
+credential requests a new server-scoped account. The opaque bearer credential
+is sent only through TLS. Reuse it on reconnect; a duplicate login replaces
+its old connection and removes the old connection's sessions. Account IDs use
+the `0x4350` high 16 bits and cannot be chosen by the client. Credentials are
+HMAC-authenticated with domain separation using the pinned server private key.
+Optional Steam bindings require the configured verifier, a valid server-bound
+ticket and matching Steam ID; otherwise the binding is zero. The legacy
+`trust_unverified_steam_ids` option never creates a verified V3 Steam binding.
+
+V3 WELCOME appends `str(account credential), u64(verified Steam ID),
+str(STUN host:port), str(TURN host:port), str(TURN username), str(TURN password)`.
+The client persists the credential before treating login as successful. TURN
+uses coturn's REST mechanism: username `expiryUnix:peerHex`, password the Base64
+HMAC-SHA1 of that username using the operator's shared secret. Credentials last
+24 hours. Clients request fresh settings every six hours for new connections;
+the shared secret itself is never sent to clients.
+
+| Direction | Type | Payload |
+|---|---:|---|
+| Client → server | 19 ROOM_JOIN | `u32 request, u64 room, str(invite capability or empty)` |
+| Client → server | 20 ROOM_LEAVE | `u64 room` |
+| Client → server | 21 SIGNAL | `u64 recipient, blob(GNS signal)` |
+| Client → server | 22 RELAY_REQUEST | empty |
+| Server → client | 115 ROOM_RESULT | `u32 request, u8 admitted` |
+| Server → client | 116 SIGNAL_RECV | `u64 authenticated sender, blob(GNS signal)` |
+| Server → client | 117 ROOM_PEERS | `u64 room, u8 count, str(capability), count × (u64 peer, u64 verified Steam ID)` |
+| Server → client | 118 RELAY_CREDENTIALS | `str(TURN username), str(TURN password)` |
+| Server → client | 119 DISCOVERY_PEER | `u64 peer, u8 seconds remaining (0 revokes, max 30)` |
+
+Publishing a V3 session admits its host and generates a random 128-bit invite
+capability. Updates preserve that capability. Room admission requires a public
+slot or the current capability, available total capacity, matching game
+protocol/mode, and no more than four memberships. Rosters contain at most 32
+peers. Leaving revokes gameplay eligibility immediately; host
+session deletion/disconnection sends an empty roster and destroys the room.
+The client ignores rosters for rooms it has already left. A recreated room has
+a new capability even if its session ID is reused.
+
+Signals are limited to 16 KiB, 20/s with a burst of 40 per player, and are only
+forwarded between current members of a shared room or peers with an active
+discovery lease. SESSION_LIST/SESSION_GET grant a 30-second lease only between
+the viewer and a matching public room host, bounded to 128 peers per client.
+Deletion or disconnect revokes the lease; expiry also closes its transport.
+A lease confers no membership, slot, invite capability or verified Steam identity.
+The client permits only UDP port 10000 discovery datagrams of at most 4096 bytes
+on these connections; all other traffic requires actual shared-room membership.
+The sender comes from the
+TLS connection, never a client field. The recipient also checks GNS rendezvous
+field 8 (`str:ttt2-<16 lowercase hex peer digits>`) against that envelope,
+including signals for existing connections. Peer checks in V3 require shared
+room membership. No gameplay packets pass through these control frames.
+
+V3 records use magic `SES3`, followed by the complete SES2 layout including its
+netcode word, then `str(server address), str(room capability)`. Public discovery
+records normally carry an empty capability; authenticated member rosters supply
+it for sharing. Steam lobby metadata carries the address and capability and
+uses the game protocol plus `-crossplay` so Steam-only searches cannot list it.
+Server discovery and SESSION_GET isolate V2 and V3. The server checks the record
+host and embedded XNADDR against the authenticated sender. Invite metadata is
+re-fetched from the active community before joining. Admission still checks the
+current capability and capacity; stale Steam records alone grant no access.
