@@ -173,7 +173,10 @@ class Build:
                    '--disable-avfilter', '--disable-network', '--disable-asm', '--disable-debug',
                    '--disable-autodetect', '--enable-decoder=wmapro,xma1,xma2', '--enable-parser=xma']
         if self.target == 'windows':
-            options += ['--toolchain=msvc', '--target-os=win64', '--arch=x86_64', '--cc=clang-cl', '--cxx=clang-cl']
+            # The game compiles FFmpeg through CMake, without configure's
+            # GNU inline-assembly flags. Match the supported Windows C path.
+            options += ['--toolchain=msvc', '--target-os=win64', '--arch=x86_64',
+                        '--cc=clang-cl', '--cxx=clang-cl', '--disable-inline-asm']
         else:
             options += ['--target-os=linux', '--arch=x86_64', '--cc=clang', '--cxx=clang++', '--enable-pic']
         self.run('Configure XMA decoder', 'bash', self.ffmpeg / 'configure', *options, cwd=build)
@@ -263,6 +266,10 @@ class Build:
         if sdk:
             options += ['-DTTT2_STEAMWORKS=' + str(sdk)]
         self.cmake(self.source / 'port', build, *options)
+        # Fail on public decoder configuration errors before compiling the
+        # large private PPC sources, and keep those diagnostics visible.
+        self.run('Compile Windows XMA decoder', 'cmake', '--build', build,
+                 '--parallel', self.jobs, '--target', 'ttt2_ffmpeg', public_output=True)
         self.compile(build, 'tekken_recomp')
         stage = self.work / 'windows-package'
         stage.mkdir()
