@@ -57,7 +57,7 @@ class Build:
         self.run('Configure ' + source.name, 'cmake', '-S', source, '-B', build, '-G', 'Ninja',
                  '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
                  '-DCMAKE_C_COMPILER=' + self.cc, '-DCMAKE_CXX_COMPILER=' + self.cxx, *options,
-                 public_output=source != self.source / 'port')
+                 public_output=True)
 
     def compile(self, build, *targets):
         self.run('Compile ' + build.name, 'cmake', '--build', build, '--parallel', self.jobs,
@@ -197,7 +197,7 @@ class Build:
         for lib in (vkbuild / '.libs').glob('libvkd3d-shader.so*'):
             shutil.copy2(lib, self.prefix / 'lib' / lib.name)
         self.script('tools/prepare_dxvk_native.py')
-        dxvk = next((self.work / 'cache/ttt2-platform/shared-dxvk').glob('source-*'))
+        dxvk = next(p for p in (self.work / 'cache/ttt2-platform/shared-dxvk').glob('source-*') if p.is_dir())
         dxbuild = self.work / 'dxvk-build'
         self.run('Configure DXVK', 'meson', 'setup', dxbuild, dxvk, '--buildtype=release',
                  '--prefix=' + str(self.prefix), '--libdir=lib', '-Denable_tests=false',
