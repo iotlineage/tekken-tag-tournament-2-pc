@@ -1,0 +1,5 @@
+{
+  "source_ref": "main",
+  "targets": ["server", "linux", "windows", "android"],
+  "steam": true
+}

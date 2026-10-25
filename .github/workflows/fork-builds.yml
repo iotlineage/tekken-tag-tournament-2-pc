@@ -1,0 +1,203 @@
+name: Fork binaries
+
+on:
+  push:
+    branches: [codex/fork-ci]
+    paths: ['.github/ci/**', '.github/workflows/fork-builds.yml']
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source branch, tag or commit in this fork'
+        required: true
+        default: main
+        type: string
+      targets:
+        description: 'Comma-separated targets: server,linux,windows,android'
+        required: true
+        default: server,linux,windows,android
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-binaries-${{ github.event.inputs.source_ref || 'request-file' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      label: ${{ steps.plan.outputs.label }}
+      steam: ${{ steps.plan.outputs.steam }}
+      server: ${{ steps.plan.outputs.server }}
+      linux: ${{ steps.plan.outputs.linux }}
+      windows: ${{ steps.plan.outputs.windows }}
+      android: ${{ steps.plan.outputs.android }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIVATE_INPUTS_REPOSITORY: ${{ vars.PRIVATE_INPUTS_REPOSITORY }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          BUILD_TARGETS: ${{ inputs.targets }}
+        run: python3 .github/ci/plan.py
+
+  server:
+    needs: plan
+    if: needs.plan.outputs.server == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: game
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: game/server/go.mod
+          cache: false
+      - name: Test and package server
+        env:
+          CI_SOURCE_SHA: ${{ needs.plan.outputs.sha }}
+        run: python3 ci/.github/ci/build.py server --source game --output artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: server-${{ needs.plan.outputs.label }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+      - if: always()
+        run: python3 ci/.github/ci/cleanup.py
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.linux == 'true'
+    runs-on: ubuntu-24.04
+    environment: private-build-inputs
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: game
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ vars.PRIVATE_INPUTS_REPOSITORY }}
+          ref: main
+          path: private-inputs
+          ssh-key: ${{ secrets.BUILD_INPUTS_SSH_KEY }}
+          persist-credentials: false
+      - run: bash ci/.github/ci/linux-deps.sh
+      - name: Build Linux game
+        env:
+          CI_STEAM: ${{ needs.plan.outputs.steam }}
+        run: python3 ci/.github/ci/build.py linux --source game --inputs private-inputs --output artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ needs.plan.outputs.label }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+      - if: always()
+        run: python3 ci/.github/ci/cleanup.py
+
+  windows:
+    needs: plan
+    if: needs.plan.outputs.windows == 'true'
+    runs-on: windows-2022
+    environment: private-build-inputs
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: game
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ vars.PRIVATE_INPUTS_REPOSITORY }}
+          ref: main
+          path: private-inputs
+          ssh-key: ${{ secrets.BUILD_INPUTS_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Build Windows game
+        shell: pwsh
+        env:
+          CI_STEAM: ${{ needs.plan.outputs.steam }}
+        run: ./ci/.github/ci/msvc.ps1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-${{ needs.plan.outputs.label }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+      - if: always()
+        run: python ci/.github/ci/cleanup.py
+
+  android:
+    needs: plan
+    if: needs.plan.outputs.android == 'true'
+    runs-on: ubuntu-24.04
+    environment: private-build-inputs
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: game
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ vars.PRIVATE_INPUTS_REPOSITORY }}
+          ref: main
+          path: private-inputs
+          ssh-key: ${{ secrets.BUILD_INPUTS_SSH_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - run: bash ci/.github/ci/linux-deps.sh
+      - name: Install pinned Android tools
+        run: sdkmanager 'platforms;android-33' 'build-tools;35.0.0' 'ndk;30.0.16248370'
+      - name: Load existing APK signing key
+        env:
+          ANDROID_RELEASE_KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE }}
+          ANDROID_RELEASE_PASSWORD: ${{ secrets.ANDROID_RELEASE_PASSWORD }}
+        run: python3 ci/.github/ci/signing.py
+      - name: Build Android APK
+        run: python3 ci/.github/ci/build.py android --source game --inputs private-inputs --output artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-${{ needs.plan.outputs.label }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
+      - if: always()
+        run: python3 ci/.github/ci/cleanup.py

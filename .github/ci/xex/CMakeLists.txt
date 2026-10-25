@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(ci_inputs C CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
+add_subdirectory("${XENON_SOURCE}" xenon)
+add_executable(ci_xex unpack.cpp)
+target_link_libraries(ci_xex PRIVATE XenonUtils)
