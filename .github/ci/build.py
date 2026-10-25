@@ -54,6 +54,9 @@ class Build:
         self.run('Check out dependency', 'git', '-C', destination, 'checkout', '--detach', 'FETCH_HEAD')
 
     def cmake(self, source, build, *options):
+        # CMake embeds these values in generated source lists; Windows
+        # backslashes would become escapes such as \a instead of separators.
+        options = tuple(option.replace('\\', '/') for option in options)
         self.run('Configure ' + source.name, 'cmake', '-S', source, '-B', build, '-G', 'Ninja',
                  '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
                  '-DCMAKE_C_COMPILER=' + self.cc, '-DCMAKE_CXX_COMPILER=' + self.cxx, *options,
@@ -172,7 +175,7 @@ class Build:
         if self.target == 'windows':
             options += ['--toolchain=msvc', '--target-os=win64', '--arch=x86_64', '--cc=clang-cl', '--cxx=clang-cl']
         else:
-            options += ['--cc=clang', '--cxx=clang++', '--enable-pic']
+            options += ['--target-os=linux', '--arch=x86_64', '--cc=clang', '--cxx=clang++', '--enable-pic']
         self.run('Configure XMA decoder', 'bash', self.ffmpeg / 'configure', *options, cwd=build)
         return build
 
