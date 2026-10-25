@@ -252,8 +252,10 @@ class Build:
         shutil.copy2(actual / 'SDL3ConfigVersion.cmake', shim)
         (shim / 'SDL3Config.cmake').write_text(
             f'include("{actual.as_posix()}/SDL3Config.cmake")\n'
-            'get_target_property(_dll SDL3::SDL3-shared IMPORTED_LOCATION_RELEASE)\n'
-            'if(_dll)\nset_property(TARGET SDL3::SDL3-shared PROPERTY IMPORTED_LOCATION "${_dll}")\nendif()\n')
+            'foreach(_property IMPORTED_LOCATION IMPORTED_IMPLIB)\n'
+            'get_target_property(_value SDL3::SDL3-shared ${_property}_RELEASE)\n'
+            'if(_value)\nset_property(TARGET SDL3::SDL3-shared PROPERTY ${_property} "${_value}")\nendif()\n'
+            'endforeach()\n')
         sdk = self.steam()
         build = self.work / 'game-build'
         options = ['-DCMAKE_BUILD_TYPE=', '-DTTT2_PPC_OPT_LEVEL=1', '-DSDL3_DIR=' + str(shim),
