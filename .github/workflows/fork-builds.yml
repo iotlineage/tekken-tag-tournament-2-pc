@@ -185,7 +185,7 @@ jobs:
           java-version: '17'
       - run: bash ci/.github/ci/linux-deps.sh
       - name: Install pinned Android tools
-        run: sdkmanager 'platforms;android-33' 'build-tools;35.0.0' 'ndk;30.0.16248370'
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-33" "build-tools;35.0.0" "ndk;30.0.16248370"'
       - name: Load existing APK signing key
         env:
           ANDROID_RELEASE_KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE }}
